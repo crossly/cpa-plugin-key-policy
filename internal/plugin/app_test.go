@@ -809,3 +809,240 @@ func TestSafePluginCallRecoversPanic(t *testing.T) {
 		t.Fatalf("safePluginCall response=%q error=%v", response, err)
 	}
 }
+
+// configureAliasRefApp builds an app whose key references a global alias
+// (KeyAliasRef form, no per-key overrides) — the shape the Key edit page
+// produces. Global alias "fast" is priced at $1/M in/out; the key has a
+// $2.00 daily limit so billing assertions can distinguish $1 vs $3 pricing.
+func configureAliasRefApp(t *testing.T) (*App, string) {
+	t.Helper()
+	app := NewApp()
+	plain := "cpa_aliasref"
+	hash := hashForTest(t, plain)
+	yaml := []byte(`
+enabled: true
+state_file: "` + filepath.ToSlash(filepath.Join(t.TempDir(), "state.json")) + `"
+aliases:
+  - alias: fast
+    targets:
+      - provider: codex
+        target_model: gpt-5-codex
+    billing_mode: tokens
+    input_price_per_million: 1
+    output_price_per_million: 1
+keys:
+  - id: aliaskey
+    enabled: true
+    key_hash: "` + hash + `"
+    key_preview: "cpa_al...ref"
+    daily_limit_usd: 2.00
+    aliases:
+      - alias: fast
+`)
+	req, _ := json.Marshal(LifecycleRequest{ConfigYAML: yaml})
+	if _, err := app.HandleMethod(MethodPluginReconfigure, req); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+	return app, plain
+}
+
+// storeKey fetches one key from the store snapshot.
+func storeKey(t *testing.T, app *App, id string) policy.KeyConfig {
+	t.Helper()
+	for _, k := range app.Store().Keys() {
+		if k.ID == id {
+			return k
+		}
+	}
+	t.Fatalf("key %q not found in store", id)
+	return policy.KeyConfig{}
+}
+
+// patchKeyRaw issues a management PATCH /keys and returns the response.
+func patchKeyRaw(t *testing.T, app *App, body string) ManagementResponse {
+	t.Helper()
+	req, _ := json.Marshal(ManagementRequest{
+		Method: http.MethodPatch,
+		Path:   "/v0/management/plugins/cpa-key-policy/keys",
+		Body:   []byte(body),
+	})
+	raw, err := app.HandleMethod(MethodManagementHandle, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return managementResponseFromEnvelope(t, raw)
+}
+
+// TestAppPatchKeyAliasPriceOverride is the regression for the reported bug:
+// the Key edit page submits models (with prices) but no aliases for an
+// alias-referencing key; previously the prices were silently dropped when
+// UpsertKey re-derived Models from the refs. Now they must land on the
+// KeyAliasRef override fields, flow into the resolved Models, and drive
+// billing ($3/M override beats the $1/M global price).
+func TestAppPatchKeyAliasPriceOverride(t *testing.T) {
+	app, plain := configureAliasRefApp(t)
+	resp := patchKeyRaw(t, app, `{"id":"aliaskey","models":[{"alias":"fast","provider":"codex","target_model":"gpt-5-codex","input_price_per_million":3,"output_price_per_million":6}]}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("patch status = %d, body = %s", resp.StatusCode, resp.Body)
+	}
+
+	key := storeKey(t, app, "aliaskey")
+	if len(key.Aliases) != 1 {
+		t.Fatalf("aliases = %+v", key.Aliases)
+	}
+	ref := key.Aliases[0]
+	if ref.InputPricePerMillion == nil || *ref.InputPricePerMillion != 3 {
+		t.Fatalf("input override = %v, want 3", ref.InputPricePerMillion)
+	}
+	if ref.OutputPricePerMillion == nil || *ref.OutputPricePerMillion != 6 {
+		t.Fatalf("output override = %v, want 6", ref.OutputPricePerMillion)
+	}
+	// Resolved Models must carry the override, not the global price.
+	rule, ok := key.ModelForAlias("fast")
+	if !ok || rule.InputPricePerMillion != 3 || rule.OutputPricePerMillion != 6 {
+		t.Fatalf("resolved model = %+v ok=%v, want override prices 3/6", rule, ok)
+	}
+
+	// Billing uses the override: 1M input tokens × $3/M = $3.00 > $2.00 daily
+	// limit → next request blocked. At the global $1/M it would be allowed.
+	usageReq, _ := json.Marshal(UsageHandleRequest{
+		APIKey: "aliaskey",
+		Alias:  "fast",
+		Detail: UsageDetail{InputTokens: 1_000_000, TotalTokens: 1_000_000},
+	})
+	if _, err := app.HandleMethod(MethodUsageHandle, usageReq); err != nil {
+		t.Fatal(err)
+	}
+	hdr := http.Header{"Authorization": {"Bearer " + plain}}
+	d := app.Store().Authenticate("POST", "/v1/chat/completions", hdr, nil, []byte(`{"model":"fast"}`))
+	if d.Allowed || !d.CostLimited || d.Reason != "daily_exceeded" {
+		t.Fatalf("override-priced billing should block at $3.00 > $2.00: %+v", d)
+	}
+}
+
+// TestAppPatchKeyAliasPriceClear verifies that zeroing the price fields (and
+// not billing per_call) removes the override so the key falls back to global
+// alias pricing.
+func TestAppPatchKeyAliasPriceClear(t *testing.T) {
+	app, plain := configureAliasRefApp(t)
+	resp := patchKeyRaw(t, app, `{"id":"aliaskey","models":[{"alias":"fast","provider":"codex","target_model":"gpt-5-codex","input_price_per_million":3,"output_price_per_million":6}]}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("patch (set) status = %d, body = %s", resp.StatusCode, resp.Body)
+	}
+	resp = patchKeyRaw(t, app, `{"id":"aliaskey","models":[{"alias":"fast","provider":"codex","target_model":"gpt-5-codex","input_price_per_million":0,"output_price_per_million":0,"cache_read_price_per_million":0,"per_call_usd":0}]}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("patch (clear) status = %d, body = %s", resp.StatusCode, resp.Body)
+	}
+
+	key := storeKey(t, app, "aliaskey")
+	ref := key.Aliases[0]
+	if ref.InputPricePerMillion != nil || ref.OutputPricePerMillion != nil ||
+		ref.CacheReadPricePerMillion != nil || ref.PerCallUSD != nil {
+		t.Fatalf("overrides should be cleared, got %+v", ref)
+	}
+	rule, _ := key.ModelForAlias("fast")
+	if rule.InputPricePerMillion != 1 || rule.OutputPricePerMillion != 1 {
+		t.Fatalf("resolved model = %+v, want global prices 1/1", rule)
+	}
+
+	// Billing is back at the global $1/M: 1M input = $1.00, under the $2
+	// limit (the stale $3 override would have blocked immediately).
+	usageReq, _ := json.Marshal(UsageHandleRequest{
+		APIKey: "aliaskey",
+		Alias:  "fast",
+		Detail: UsageDetail{InputTokens: 1_000_000, TotalTokens: 1_000_000},
+	})
+	if _, err := app.HandleMethod(MethodUsageHandle, usageReq); err != nil {
+		t.Fatal(err)
+	}
+	hdr := http.Header{"Authorization": {"Bearer " + plain}}
+	d := app.Store().Authenticate("POST", "/v1/chat/completions", hdr, nil, []byte(`{"model":"fast"}`))
+	if !d.Allowed {
+		t.Fatalf("global-priced billing of $1.00 should stay under the $2.00 limit: %+v", d)
+	}
+}
+
+// TestAppPatchKeyWithoutModelsKeepsGlobalPricing is the no-price-change
+// regression: a PATCH that does not submit models must not pin the resolved
+// (global) prices as per-key overrides.
+func TestAppPatchKeyWithoutModelsKeepsGlobalPricing(t *testing.T) {
+	app, _ := configureAliasRefApp(t)
+	resp := patchKeyRaw(t, app, `{"id":"aliaskey","rpm":30}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("patch status = %d, body = %s", resp.StatusCode, resp.Body)
+	}
+	key := storeKey(t, app, "aliaskey")
+	ref := key.Aliases[0]
+	if ref.InputPricePerMillion != nil || ref.OutputPricePerMillion != nil ||
+		ref.CacheReadPricePerMillion != nil || ref.PerCallUSD != nil {
+		t.Fatalf("overrides must stay nil on a models-less patch, got %+v", ref)
+	}
+	rule, _ := key.ModelForAlias("fast")
+	if rule.InputPricePerMillion != 1 {
+		t.Fatalf("resolved model = %+v, want global price 1", rule)
+	}
+}
+
+// TestAppCreateKeyInlineModelsUnchanged pins the legacy inline-models create
+// path: with no aliases submitted, migration still creates a bare ref (no
+// overrides) and pricing comes from the global alias table.
+func TestAppCreateKeyInlineModelsUnchanged(t *testing.T) {
+	app, _ := configureAliasRefApp(t)
+	createBody := []byte(`{"id":"inline-key","models":[{"alias":"fast","provider":"codex","target_model":"gpt-5-codex"}]}`)
+	req, _ := json.Marshal(ManagementRequest{
+		Method: http.MethodPost,
+		Path:   "/v0/management/plugins/cpa-key-policy/keys",
+		Body:   createBody,
+	})
+	raw, err := app.HandleMethod(MethodManagementHandle, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := managementResponseFromEnvelope(t, raw)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create status = %d, body = %s", resp.StatusCode, resp.Body)
+	}
+	key := storeKey(t, app, "inline-key")
+	if len(key.Aliases) != 1 || key.Aliases[0].Alias != "fast" {
+		t.Fatalf("aliases = %+v, want single ref {fast}", key.Aliases)
+	}
+	ref := key.Aliases[0]
+	if ref.InputPricePerMillion != nil || ref.OutputPricePerMillion != nil ||
+		ref.CacheReadPricePerMillion != nil || ref.PerCallUSD != nil {
+		t.Fatalf("inline create must not produce overrides, got %+v", ref)
+	}
+	rule, _ := key.ModelForAlias("fast")
+	if rule.InputPricePerMillion != 1 {
+		t.Fatalf("resolved model = %+v, want global price 1", rule)
+	}
+}
+
+// TestAppCreateKeyAliasRefWithPrices covers the createKey twin of the bug:
+// a create that submits both alias refs and priced models must fold the
+// prices into the refs' overrides.
+func TestAppCreateKeyAliasRefWithPrices(t *testing.T) {
+	app, _ := configureAliasRefApp(t)
+	createBody := []byte(`{"id":"priced-key","aliases":[{"alias":"fast"}],"models":[{"alias":"fast","provider":"codex","target_model":"gpt-5-codex","input_price_per_million":4,"output_price_per_million":8}]}`)
+	req, _ := json.Marshal(ManagementRequest{
+		Method: http.MethodPost,
+		Path:   "/v0/management/plugins/cpa-key-policy/keys",
+		Body:   createBody,
+	})
+	raw, err := app.HandleMethod(MethodManagementHandle, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := managementResponseFromEnvelope(t, raw)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create status = %d, body = %s", resp.StatusCode, resp.Body)
+	}
+	key := storeKey(t, app, "priced-key")
+	if len(key.Aliases) != 1 {
+		t.Fatalf("aliases = %+v", key.Aliases)
+	}
+	ref := key.Aliases[0]
+	if ref.InputPricePerMillion == nil || *ref.InputPricePerMillion != 4 ||
+		ref.OutputPricePerMillion == nil || *ref.OutputPricePerMillion != 8 {
+		t.Fatalf("overrides = %+v, want 4/8", ref)
+	}
+}

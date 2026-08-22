@@ -766,3 +766,147 @@ keys:
 		t.Fatalf("expected single ref {keep}, got %+v", cfg.Keys[0].Aliases)
 	}
 }
+
+// TestApplyModelPricesToAliasRefs covers the price-merge helper that folds
+// submitted ModelRule prices into KeyAliasRef overrides on the management
+// write path (patchKey/createKey). See the helper's doc comment for semantics.
+func TestApplyModelPricesToAliasRefs(t *testing.T) {
+	f64 := func(v float64) *float64 { return &v }
+	cases := []struct {
+		name  string
+		key   KeyConfig
+		check func(t *testing.T, key KeyConfig)
+	}{
+		{
+			name: "priced row sets all four overrides",
+			key: KeyConfig{
+				Aliases: []KeyAliasRef{{Alias: "fast"}},
+				Models: []ModelRule{{
+					Alias: "fast", Provider: "codex", TargetModel: "gpt-5-codex",
+					InputPricePerMillion: 3, OutputPricePerMillion: 6,
+					CacheReadPricePerMillion: 0.5, PerCallUSD: 0,
+				}},
+			},
+			check: func(t *testing.T, key KeyConfig) {
+				ref := key.Aliases[0]
+				if ref.InputPricePerMillion == nil || *ref.InputPricePerMillion != 3 {
+					t.Fatalf("input override = %v, want 3", ref.InputPricePerMillion)
+				}
+				if ref.OutputPricePerMillion == nil || *ref.OutputPricePerMillion != 6 {
+					t.Fatalf("output override = %v, want 6", ref.OutputPricePerMillion)
+				}
+				if ref.CacheReadPricePerMillion == nil || *ref.CacheReadPricePerMillion != 0.5 {
+					t.Fatalf("cache override = %v, want 0.5", ref.CacheReadPricePerMillion)
+				}
+				if ref.PerCallUSD == nil || *ref.PerCallUSD != 0 {
+					t.Fatalf("per_call override = %v, want 0", ref.PerCallUSD)
+				}
+			},
+		},
+		{
+			name: "all-zero token row clears existing overrides",
+			key: KeyConfig{
+				Aliases: []KeyAliasRef{{
+					Alias:                "fast",
+					InputPricePerMillion: f64(3), OutputPricePerMillion: f64(6),
+				}},
+				Models: []ModelRule{{Alias: "fast", Provider: "codex", TargetModel: "gpt-5-codex"}},
+			},
+			check: func(t *testing.T, key KeyConfig) {
+				ref := key.Aliases[0]
+				if ref.InputPricePerMillion != nil || ref.OutputPricePerMillion != nil ||
+					ref.CacheReadPricePerMillion != nil || ref.PerCallUSD != nil {
+					t.Fatalf("overrides should be cleared to nil, got %+v", ref)
+				}
+			},
+		},
+		{
+			name: "all-zero per_call row still sets overrides (free calls)",
+			key: KeyConfig{
+				Aliases: []KeyAliasRef{{Alias: "fast"}},
+				Models: []ModelRule{{
+					Alias: "fast", Provider: "codex", TargetModel: "gpt-5-codex",
+					BillingMode: "per_call", PerCallUSD: 0,
+				}},
+			},
+			check: func(t *testing.T, key KeyConfig) {
+				ref := key.Aliases[0]
+				if ref.PerCallUSD == nil || *ref.PerCallUSD != 0 {
+					t.Fatalf("per_call override = %v, want explicit 0", ref.PerCallUSD)
+				}
+			},
+		},
+		{
+			name: "matching is case-insensitive",
+			key: KeyConfig{
+				Aliases: []KeyAliasRef{{Alias: "Fast"}},
+				Models: []ModelRule{{
+					Alias: "FAST", Provider: "codex", TargetModel: "gpt-5-codex",
+					InputPricePerMillion: 2,
+				}},
+			},
+			check: func(t *testing.T, key KeyConfig) {
+				ref := key.Aliases[0]
+				if ref.InputPricePerMillion == nil || *ref.InputPricePerMillion != 2 {
+					t.Fatalf("input override = %v, want 2", ref.InputPricePerMillion)
+				}
+			},
+		},
+		{
+			name: "ref without a matching model row is untouched",
+			key: KeyConfig{
+				Aliases: []KeyAliasRef{{Alias: "fast", InputPricePerMillion: f64(9)}, {Alias: "other"}},
+				Models: []ModelRule{{
+					Alias: "other", Provider: "codex", TargetModel: "gpt-5-codex",
+					InputPricePerMillion: 1,
+				}},
+			},
+			check: func(t *testing.T, key KeyConfig) {
+				if key.Aliases[0].InputPricePerMillion == nil || *key.Aliases[0].InputPricePerMillion != 9 {
+					t.Fatalf("unmatched ref override changed: %+v", key.Aliases[0])
+				}
+				if key.Aliases[1].InputPricePerMillion == nil || *key.Aliases[1].InputPricePerMillion != 1 {
+					t.Fatalf("matched ref override = %v, want 1", key.Aliases[1].InputPricePerMillion)
+				}
+			},
+		},
+		{
+			name: "multi-target alias: first submitted row wins",
+			key: KeyConfig{
+				Aliases: []KeyAliasRef{{Alias: "fast"}},
+				Models: []ModelRule{
+					{Alias: "fast", Provider: "codex", TargetModel: "gpt-5-codex", Group: "free", InputPricePerMillion: 4},
+					{Alias: "fast", Provider: "codex", TargetModel: "gpt-5-codex", Group: "team", InputPricePerMillion: 8},
+				},
+			},
+			check: func(t *testing.T, key KeyConfig) {
+				ref := key.Aliases[0]
+				if ref.InputPricePerMillion == nil || *ref.InputPricePerMillion != 4 {
+					t.Fatalf("input override = %v, want 4 (first row)", ref.InputPricePerMillion)
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ApplyModelPricesToAliasRefs(&tc.key)
+			tc.check(t, tc.key)
+		})
+	}
+}
+
+// TestApplyModelPricesToAliasRefsNoop guards the early-exit paths: no refs,
+// no models, or nil key must not panic or mutate anything.
+func TestApplyModelPricesToAliasRefsNoop(t *testing.T) {
+	ApplyModelPricesToAliasRefs(nil)
+	key := KeyConfig{Models: []ModelRule{{Alias: "fast", InputPricePerMillion: 5}}}
+	ApplyModelPricesToAliasRefs(&key) // no Aliases → nothing to merge into
+	if len(key.Aliases) != 0 {
+		t.Fatalf("aliases mutated: %+v", key.Aliases)
+	}
+	key2 := KeyConfig{Aliases: []KeyAliasRef{{Alias: "fast", InputPricePerMillion: nil}}}
+	ApplyModelPricesToAliasRefs(&key2) // no Models → no signal, leave refs alone
+	if key2.Aliases[0].InputPricePerMillion != nil {
+		t.Fatalf("override should stay nil, got %+v", key2.Aliases[0])
+	}
+}

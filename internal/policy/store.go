@@ -860,6 +860,74 @@ func resolveAliasRefsToModels(refs []KeyAliasRef, aliases map[string]*AliasMappi
 	return out
 }
 
+// ApplyModelPricesToAliasRefs merges per-key price overrides from a submitted
+// Models list into the key's Alias refs. The management UI submits pricing as
+// ModelRule rows (keyed frontend-side by (group|alias); see priceKey in
+// KeyForm.tsx), while the canonical per-key override lives on KeyAliasRef
+// (per alias name, *float64 with nil = use global alias pricing). Without this
+// merge, a PATCH that carries Models but not Aliases silently drops the
+// prices: migrateModelsToAliases keeps the existing refs (which carry no
+// overrides) and UpsertKey re-derives Models from them, so billing falls back
+// to global prices.
+//
+// Matching is by alias name, case-insensitive; when a multi-target alias
+// expands to several submitted rows the first row wins (the override is
+// alias-level and cannot represent per-group prices anyway). For each matched
+// ref:
+//   - if any of the four price fields is non-zero, or the row bills per_call,
+//     all four fields are copied into the ref's override pointers (the UI
+//     always submits complete rows, pre-filled with the resolved prices, so
+//     untouched fields round-trip their current value);
+//   - otherwise (all prices zero under token billing) the overrides are
+//     cleared to nil, falling back to global alias pricing.
+//
+// Refs without a matching row are left untouched. Callers must only invoke
+// this when Models was actually submitted by the client — passing the
+// store-derived Models (global prices baked in) would pin global prices as
+// permanent per-key overrides.
+func ApplyModelPricesToAliasRefs(key *KeyConfig) {
+	if key == nil || len(key.Aliases) == 0 || len(key.Models) == 0 {
+		return
+	}
+	priceByAlias := make(map[string]ModelRule, len(key.Models))
+	for _, m := range key.Models {
+		lk := strings.ToLower(strings.TrimSpace(m.Alias))
+		if lk == "" {
+			continue
+		}
+		if _, ok := priceByAlias[lk]; !ok {
+			priceByAlias[lk] = m
+		}
+	}
+	for i := range key.Aliases {
+		ref := &key.Aliases[i]
+		row, ok := priceByAlias[strings.ToLower(strings.TrimSpace(ref.Alias))]
+		if !ok {
+			continue
+		}
+		isPerCall := strings.EqualFold(strings.TrimSpace(row.BillingMode), "per_call")
+		hasPrice := row.InputPricePerMillion != 0 || row.OutputPricePerMillion != 0 ||
+			row.CacheReadPricePerMillion != 0 || row.PerCallUSD != 0
+		if !hasPrice && !isPerCall {
+			// No price signal: clear the override so the key falls back to
+			// global alias pricing.
+			ref.InputPricePerMillion = nil
+			ref.OutputPricePerMillion = nil
+			ref.CacheReadPricePerMillion = nil
+			ref.PerCallUSD = nil
+			continue
+		}
+		in := row.InputPricePerMillion
+		out := row.OutputPricePerMillion
+		cacheRead := row.CacheReadPricePerMillion
+		perCall := row.PerCallUSD
+		ref.InputPricePerMillion = &in
+		ref.OutputPricePerMillion = &out
+		ref.CacheReadPricePerMillion = &cacheRead
+		ref.PerCallUSD = &perCall
+	}
+}
+
 func (s *Store) Keys() []KeyConfig {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

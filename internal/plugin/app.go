@@ -636,6 +636,12 @@ func (a *App) createKey(body []byte) ManagementResponse {
 		WeeklyLimitUSD:      applyFloat64(req.WeeklyLimitUSD, 0),
 		AllowModelsEndpoint: applyBool(req.AllowModelsEndpoint, false),
 	}
+	// If the client submitted both alias refs and priced models, fold the
+	// submitted prices into the refs' per-key overrides — otherwise UpsertKey
+	// would re-derive Models from the refs and silently drop the prices.
+	if req.Models != nil {
+		policy.ApplyModelPricesToAliasRefs(&item)
+	}
 	if err := a.store.UpsertKey(item, true); err != nil {
 		return jsonError(http.StatusBadRequest, "invalid_policy", err.Error())
 	}
@@ -691,6 +697,16 @@ func (a *App) patchKey(body []byte) ManagementResponse {
 	}
 	if req.Aliases != nil {
 		current.Aliases = req.Aliases
+	}
+	if req.Models != nil && len(current.Aliases) > 0 {
+		// The client submitted priced models for an alias-referencing key
+		// (the Key edit page sends models but not aliases): fold the prices
+		// into the refs' per-key overrides before UpsertKey re-derives Models
+		// from the refs, which would otherwise silently drop them. Only run
+		// when Models was actually submitted — current.Models otherwise holds
+		// store-derived rows with global prices baked in, and merging those
+		// would pin global prices as permanent overrides.
+		policy.ApplyModelPricesToAliasRefs(current)
 	}
 	if strings.TrimSpace(req.Key) != "" {
 		hash, err := policy.HashKey(req.Key)
