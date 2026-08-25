@@ -132,10 +132,9 @@ type ModelRouteResponse struct {
 	Reason      string `json:"Reason,omitempty"`
 }
 
-// SchedulerPickRequest is the payload of the host->plugin scheduler.pick call.
-// It mirrors pluginapi.SchedulerPickRequest. The plugin only needs Provider,
-// Model, Options.Metadata (carrying the group we stamped at authenticate time)
-// and Candidates[].Attributes (codex plan_type etc.).
+// SchedulerPickRequest 是宿主调用 scheduler.pick 时的载荷。
+// 其结构与 pluginapi.SchedulerPickRequest 保持一致：Options 携带请求头与
+// 可选的 group 元数据，Candidates 携带凭证档位与权重属性。
 type SchedulerPickRequest struct {
 	Provider   string                   `json:"Provider,omitempty"`
 	Providers  []string                 `json:"Providers,omitempty"`

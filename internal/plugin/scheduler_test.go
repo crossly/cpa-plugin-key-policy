@@ -9,31 +9,59 @@ import (
 	"testing"
 )
 
-func TestSchedulerPickNoGroupDefers(t *testing.T) {
-	app, _ := configureTestApp(t)
-	req, _ := json.Marshal(SchedulerPickRequest{
+func TestSchedulerPickNoGroupUsesGlobalWeightedRoundRobin(t *testing.T) {
+	app, plain := configureTestApp(t)
+	request := SchedulerPickRequest{
 		Provider: "codex",
 		Model:    "gpt-5-codex",
-		Options:  SchedulerPickOptions{Metadata: map[string]any{}},
-		Candidates: []SchedulerAuthCandidate{
-			{ID: "codex-a-free", Provider: "codex", Attributes: map[string]string{"plan_type": "free"}},
-			{ID: "codex-b-team", Provider: "codex", Attributes: map[string]string{"plan_type": "team"}},
+		Options: SchedulerPickOptions{
+			Headers:  map[string][]string{"Authorization": {"Bearer " + plain}},
+			Metadata: map[string]any{},
 		},
-	})
-	raw, err := app.HandleMethod(MethodSchedulerPick, req)
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "codex-plus", Provider: "codex", Weight: 4, Attributes: map[string]string{"plan_type": "plus"}},
+			{ID: "codex-prolite", Provider: "codex", Weight: 1, Attributes: map[string]string{"plan_type": "prolite"}},
+		},
+	}
+
+	counts := map[string]int{}
+	for index := 0; index < 10; index++ {
+		resp := schedulerPickForTest(t, app, request)
+		counts[resp.AuthID]++
+	}
+	if counts["codex-plus"] != 8 || counts["codex-prolite"] != 2 {
+		t.Fatalf("期望无组时在全部凭证中按 4:1 分配，实际为 %v", counts)
+	}
+}
+
+func TestSchedulerPickNoGroupDefersNativeKey(t *testing.T) {
+	app, _ := configureTestApp(t)
+	request := SchedulerPickRequest{
+		Provider: "codex",
+		Model:    "gpt-5-codex",
+		Options: SchedulerPickOptions{
+			Headers: map[string][]string{"Authorization": {"Bearer native-key"}},
+		},
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "codex-a", Provider: "codex", Weight: 4},
+			{ID: "codex-b", Provider: "codex", Weight: 1},
+		},
+	}
+
+	rawRequest, err := json.Marshal(request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var env Envelope
-	if err := json.Unmarshal(raw, &env); err != nil {
+	rawResponse, err := app.HandleMethod(MethodSchedulerPick, rawRequest)
+	if err != nil {
 		t.Fatal(err)
 	}
-	var resp SchedulerPickResponse
-	if err := json.Unmarshal(env.Result, &resp); err != nil {
+	var response SchedulerPickResponse
+	if err := unmarshalOK(rawResponse, &response); err != nil {
 		t.Fatal(err)
 	}
-	if resp.Handled {
-		t.Fatalf("expected Handled=false when no group, got %+v", resp)
+	if response.Handled {
+		t.Fatalf("原生密钥不应被插件的无组调度接管，实际为 %+v", response)
 	}
 }
 

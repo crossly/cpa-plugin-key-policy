@@ -698,6 +698,12 @@ func (s *Store) FindByAPIKey(raw string) *KeyConfig {
 	return s.findBySecret(raw)
 }
 
+// OwnsRequestKey 报告请求是否使用了当前已启用的插件密钥。
+func (s *Store) OwnsRequestKey(headers http.Header) bool {
+	key, enabled := s.findBySecretWhenEnabled(ExtractAPIKey(headers, nil))
+	return enabled && key != nil && key.Enabled
+}
+
 func (s *Store) findBySecret(raw string) *KeyConfig {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {

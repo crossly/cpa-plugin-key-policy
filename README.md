@@ -60,13 +60,13 @@ Two sources of “which auth file may serve this request”:
 
 **Runtime rule:** if a mapping sets a group, the plugin scheduler **only** picks auth files in that group. No match → hard failure (`auth_not_found`), never silently fall back to another tier.
 
-**Scheduling inside a group:** the plugin keeps the highest available `Priority` tier, then applies **smooth weighted round-robin** using each credential's `weight`:
+**Scheduling:** the plugin keeps the highest available `Priority` tier, then applies **smooth weighted round-robin** using each credential's `weight`:
 
 - Weight is read from the CPA credential candidate's `Weight`, `Attributes.weight`, or `Metadata.weight` field.
 - Missing or invalid weight defaults to `1`; non-positive weight stops new requests; values are capped at `1000000`.
-- State is shared globally by `provider + model + group + Priority`, so all downstream `cpa_…` keys contribute to one distribution.
+- State is shared globally by `provider + model + group + Priority`, so all downstream `cpa_…` keys contribute to one distribution. An empty group is one global pool containing every candidate CPA offers for that provider/model.
 - Lower-priority credentials participate only when every higher-priority credential is unavailable or has non-positive weight.
-- When a mapping has no group, the plugin defers credential selection to CPA's global `routing.strategy`.
+- When CPA does not propagate frontend-auth group metadata (including CPA `7.2.140`), plugin-owned keys still use global weighted round-robin instead of falling back to CPA's `routing.strategy`; native CPA keys remain untouched.
 
 **Custom classification** (Web UI → Mapping → Credential Classification):
 
@@ -91,7 +91,7 @@ Channels under CPA `openai-compatibility` (e.g. a named proxy) use the **channel
 |------|------|
 | Frontend auth | Know plugin keys; enforce alias allow-list, RPM, budget; stamp route + group metadata |
 | Model router | Alias → provider + target model |
-| Scheduler | When `group` is set, filter candidates and smooth-weight them within the highest Priority tier |
+| Scheduler | Optionally filter candidates by `group`, then smooth-weight them within the highest Priority tier |
 | Response interceptor | Non-stream JSON: rewrite top-level `model` back to the alias |
 | Usage | Token / per-call billing into the state file |
 | Management API + embedded Web UI | Keys, aliases, classify rules, status |

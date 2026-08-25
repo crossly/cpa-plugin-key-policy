@@ -58,13 +58,13 @@ Key 可以**引用**别名，不必重复填目标。多目标别名会展开成
 
 **运行时规则：** 映射里写了 group，调度就**只**在该组凭证里选文件。没有可用文件 → 直接失败（`auth_not_found`），**绝不**偷偷落到其他档。
 
-**组内调度：** 插件先保留可用凭证中 `Priority` 最高的一层，再按凭证的 `weight` 执行**平滑加权轮询**：
+**调度：** 插件先保留可用凭证中 `Priority` 最高的一层，再按凭证的 `weight` 执行**平滑加权轮询**：
 
 - 权重来自 CPA 凭证配置，插件兼容候选的 `Weight`、`Attributes.weight` 和 `Metadata.weight`。
 - 未配置或无法解析时按 `1` 处理；非正数表示暂停接收新请求；最大按 `1000000` 处理。
-- 轮询状态按 `provider + model + group + Priority` 全局共享，所有 `cpa_…` key 共用同一分配比例。
+- 轮询状态按 `provider + model + group + Priority` 全局共享，所有 `cpa_…` key 共用同一分配比例。group 为空时，CPA 为该 provider/model 提供的全部候选凭证形成一个全局池。
 - 低 `Priority` 凭证仅在更高优先级凭证全部不可用或权重非正时参与。
-- 映射没有 group 时插件不接管凭证选择，仍由 CPA 的全局 `routing.strategy` 决定。
+- CPA 未转发前端鉴权 group 元数据时（包括 CPA `7.2.140`），插件自有密钥仍会执行全局加权轮询，不再回退到 CPA 的 `routing.strategy`；CPA 原生密钥不受影响。
 
 **自定义归类**（网页 → 映射 → 凭证归类）：
 
@@ -89,7 +89,7 @@ CPA 里配置的兼容通道，映射时 `provider` 填通道 **name**。插件�
 |------|------|
 | 前端鉴权 | 识别插件 key；校验别名、RPM、额度；写入路由与 group 元数据 |
 | 模型路由 | 别名 → provider + 目标模型 |
-| 调度 | 有 group 时按档位 / `classify:` 过滤，并在最高 Priority 层内平滑加权轮询 |
+| 调度 | 可选按 group 档位 / `classify:` 过滤，并在最高 Priority 层内平滑加权轮询 |
 | 响应拦截 | 非流式 JSON：把顶层 `model` 改回别名 |
 | 用量 | token / 按次计费写入 state |
 | 管理 API + 内嵌网页 | Key、别名、归类、状态 |
