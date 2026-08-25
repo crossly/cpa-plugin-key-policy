@@ -60,6 +60,14 @@ Two sources of “which auth file may serve this request”:
 
 **Runtime rule:** if a mapping sets a group, the plugin scheduler **only** picks auth files in that group. No match → hard failure (`auth_not_found`), never silently fall back to another tier.
 
+**Scheduling inside a group:** the plugin keeps the highest available `Priority` tier, then applies **smooth weighted round-robin** using each credential's `weight`:
+
+- Weight is read from the CPA credential candidate's `Weight`, `Attributes.weight`, or `Metadata.weight` field.
+- Missing or invalid weight defaults to `1`; non-positive weight stops new requests; values are capped at `1000000`.
+- State is shared globally by `provider + model + group + Priority`, so all downstream `cpa_…` keys contribute to one distribution.
+- Lower-priority credentials participate only when every higher-priority credential is unavailable or has non-positive weight.
+- When a mapping has no group, the plugin defers credential selection to CPA's global `routing.strategy`.
+
 **Custom classification** (Web UI → Mapping → Credential Classification):
 
 - Match auth-file fields (`filename`, `provider`, `plan_type`, `tier`, …) with a regex.
@@ -83,7 +91,7 @@ Channels under CPA `openai-compatibility` (e.g. a named proxy) use the **channel
 |------|------|
 | Frontend auth | Know plugin keys; enforce alias allow-list, RPM, budget; stamp route + group metadata |
 | Model router | Alias → provider + target model |
-| Scheduler | When `group` is set, filter auth candidates by tier / `classify:` group |
+| Scheduler | When `group` is set, filter candidates and smooth-weight them within the highest Priority tier |
 | Response interceptor | Non-stream JSON: rewrite top-level `model` back to the alias |
 | Usage | Token / per-call billing into the state file |
 | Management API + embedded Web UI | Keys, aliases, classify rules, status |

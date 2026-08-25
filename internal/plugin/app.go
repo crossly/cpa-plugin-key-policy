@@ -17,6 +17,8 @@ type App struct {
 	store         *policy.Store
 	classifyMu    sync.RWMutex
 	classifyCache map[string][]string
+	schedulerMu   sync.Mutex
+	schedulerRR   map[string]*smoothWeightedState
 }
 
 const classifyCacheCapacity = 4096
@@ -24,7 +26,11 @@ const classifyCacheCapacity = 4096
 func NewApp() *App {
 	store := policy.NewStore()
 	_ = store.Configure(policy.DefaultConfig())
-	return &App{store: store, classifyCache: make(map[string][]string)}
+	return &App{
+		store:         store,
+		classifyCache: make(map[string][]string),
+		schedulerRR:   make(map[string]*smoothWeightedState),
+	}
 }
 
 func (a *App) HandleMethod(method string, request []byte) ([]byte, error) {
@@ -88,8 +94,10 @@ func (a *App) configure(raw []byte) error {
 	// Register the classify cache clear callback, then clear once for safety.
 	a.store.SetOnClassifyRulesChanged(func() {
 		a.clearClassifyCache()
+		a.clearSchedulerState()
 	})
 	a.clearClassifyCache()
+	a.clearSchedulerState()
 	a.store.StartUsageFlusher()
 	return nil
 }
@@ -253,12 +261,10 @@ func (a *App) interceptResponse(raw []byte) ([]byte, error) {
 //     bucket), so a supported-but-untiered auth file serves them rather than
 //     any tiered one.
 //
-// Among filtered candidates, pick the host's highest-priority one (ties broken
-// by lowest ID for determinism). We do not have access to the model-capability
-// registry here (it's a separate pluginapi capability), so the host still owns
-// the final "is this auth able to serve this model" check via delegate; if a
-// chosen candidate can't serve the model the host falls back. This is the same
-// trust boundary the built-in scheduler operates under.
+// 过滤后只保留最高优先级的一层，再按凭证权重执行平滑加权轮询。权重默认
+// 为 1，非正数表示不再接收新请求，过大的权重会被限制。状态按
+// provider/model/group/priority 全局共享，因此所有下游 cpa_* 密钥共用
+// 同一个分配序列，而不是各自重新开始轮询。
 func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	var req SchedulerPickRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
@@ -291,14 +297,28 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 		return ErrorEnvelope("auth_not_found", "cpa-key-policy: no eligible auth candidate for requested group", http.StatusServiceUnavailable), nil
 	}
 
-	best := matched[0]
-	for _, cand := range matched[1:] {
-		if cand.Priority > best.Priority ||
-			(cand.Priority == best.Priority && cand.ID < best.ID) {
-			best = cand
+	maxPriority := 0
+	prioritySet := false
+	weighted := make([]SchedulerAuthCandidate, 0, len(matched))
+	for _, cand := range matched {
+		if schedulerCandidateWeight(cand) <= 0 {
+			continue
+		}
+		if !prioritySet || cand.Priority > maxPriority {
+			maxPriority = cand.Priority
+			prioritySet = true
+			weighted = weighted[:0]
+		}
+		if cand.Priority == maxPriority {
+			weighted = append(weighted, cand)
 		}
 	}
-	return OKEnvelope(SchedulerPickResponse{Handled: true, AuthID: best.ID})
+	if len(weighted) == 0 {
+		return ErrorEnvelope("auth_not_found", "cpa-key-policy: 匹配的凭证均没有正权重", http.StatusServiceUnavailable), nil
+	}
+
+	picked := a.pickSmoothWeighted(req, group, maxPriority, weighted)
+	return OKEnvelope(SchedulerPickResponse{Handled: true, AuthID: picked.ID})
 }
 
 func schedulerCandidateUsable(status string) bool {
