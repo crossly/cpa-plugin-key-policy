@@ -65,6 +65,7 @@ Key 可以**引用**别名，不必重复填目标。多目标别名会展开成
 - 轮询状态按 `provider + model + group + Priority` 全局共享，所有 `cpa_…` key 共用同一分配比例。group 为空时，CPA 为该 provider/model 提供的全部候选凭证形成一个全局池。
 - 低 `Priority` 凭证仅在更高优先级凭证全部不可用或权重非正时参与。
 - CPA 未转发前端鉴权 group 元数据时（包括 CPA `7.2.140`），插件自有密钥仍会执行全局加权轮询，不再回退到 CPA 的 `routing.strategy`；CPA 原生密钥不受影响。
+- 设置 `global_weighted_round_robin: true` 后，即使 CPA 能转发 group，插件也会主动忽略它，并在当前 provider/model 的全部候选凭证中按 Weight 调度。
 
 **自定义归类**（网页 → 映射 → 凭证归类）：
 
@@ -128,11 +129,14 @@ plugins:
       enabled: true
       priority: 10
       state_file: "cpa-key-policy-state.json"
+      global_weighted_round_robin: true
 ```
 
 说明：
 
 - 若已有 `state_file`，则以其中的 keys / 别名 / 归类 / 用量为准。
+- `global_weighted_round_robin: true` 会忽略别名目标选中的 group，把当前 provider/model 的所有候选凭证放入同一个全局权重池。默认为 `false`。
+- 开启该选项后，别名层的 group 仍会轮询，但不再限制最终凭证；分配比例只由 CPA 凭证页的 Weight 决定。
 - 日常请用**网页**或管理 API 建 key 和别名；YAML 种子数据主要用于首次启动。
 - 公开文档里不要写真实管理密钥、主机名或凭证内容。
 

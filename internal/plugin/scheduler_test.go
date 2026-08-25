@@ -65,6 +65,96 @@ func TestSchedulerPickNoGroupDefersNativeKey(t *testing.T) {
 	}
 }
 
+func TestSchedulerPickGlobalModeIgnoresReceivedGroup(t *testing.T) {
+	app, plain := configureGlobalSchedulerApp(t)
+	request := SchedulerPickRequest{
+		Provider: "codex",
+		Model:    "gpt-5-codex",
+		Options: SchedulerPickOptions{
+			Headers:  map[string][]string{"Authorization": {"Bearer " + plain}},
+			Metadata: map[string]any{"group": "plus"},
+		},
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "codex-plus", Provider: "codex", Weight: 4, Attributes: map[string]string{"plan_type": "plus"}},
+			{ID: "codex-prolite", Provider: "codex", Weight: 1, Attributes: map[string]string{"plan_type": "prolite"}},
+		},
+	}
+
+	counts := map[string]int{}
+	for index := 0; index < 10; index++ {
+		response := schedulerPickForTest(t, app, request)
+		counts[response.AuthID]++
+	}
+	if counts["codex-plus"] != 8 || counts["codex-prolite"] != 2 {
+		t.Fatalf("开启全局模式后应忽略 group 并按 4:1 分配，实际为 %v", counts)
+	}
+}
+
+func TestSchedulerPickGlobalModeDefersNativeKey(t *testing.T) {
+	app, _ := configureGlobalSchedulerApp(t)
+	request := SchedulerPickRequest{
+		Provider: "codex",
+		Model:    "gpt-5-codex",
+		Options: SchedulerPickOptions{
+			Headers:  map[string][]string{"Authorization": {"Bearer native-key"}},
+			Metadata: map[string]any{"group": "plus"},
+		},
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "codex-plus", Provider: "codex", Weight: 4, Attributes: map[string]string{"plan_type": "plus"}},
+			{ID: "codex-prolite", Provider: "codex", Weight: 1, Attributes: map[string]string{"plan_type": "prolite"}},
+		},
+	}
+
+	rawRequest, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawResponse, err := app.HandleMethod(MethodSchedulerPick, rawRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response SchedulerPickResponse
+	if err := unmarshalOK(rawResponse, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Handled {
+		t.Fatalf("全局模式不应接管 CPA 原生密钥，实际为 %+v", response)
+	}
+}
+
+func configureGlobalSchedulerApp(t *testing.T) (*App, string) {
+	t.Helper()
+	app := NewApp()
+	plain := "cpa_global_weighted_test"
+	hash := hashForTest(t, plain)
+	configYAML := []byte(`
+enabled: true
+global_weighted_round_robin: true
+state_file: "` + filepath.ToSlash(filepath.Join(t.TempDir(), "state.json")) + `"
+keys:
+  - id: global-weighted
+    name: Global Weighted
+    enabled: true
+    key_hash: "` + hash + `"
+    key_preview: "cpa_glo..._test"
+    models:
+      - alias: fast
+        provider: codex
+        target_model: gpt-5-codex
+`)
+	request, err := json.Marshal(LifecycleRequest{ConfigYAML: configYAML})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.HandleMethod(MethodPluginReconfigure, request); err != nil {
+		t.Fatalf("配置全局加权调度测试应用失败: %v", err)
+	}
+	if !app.store.GlobalWeightedRoundRobin() {
+		t.Fatal("期望全局加权轮询开关已启用")
+	}
+	return app, plain
+}
+
 func TestSchedulerPickFiltersByPlanType(t *testing.T) {
 	app, _ := configureTestApp(t)
 	req, _ := json.Marshal(SchedulerPickRequest{

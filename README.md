@@ -67,6 +67,7 @@ Two sources of “which auth file may serve this request”:
 - State is shared globally by `provider + model + group + Priority`, so all downstream `cpa_…` keys contribute to one distribution. An empty group is one global pool containing every candidate CPA offers for that provider/model.
 - Lower-priority credentials participate only when every higher-priority credential is unavailable or has non-positive weight.
 - When CPA does not propagate frontend-auth group metadata (including CPA `7.2.140`), plugin-owned keys still use global weighted round-robin instead of falling back to CPA's `routing.strategy`; native CPA keys remain untouched.
+- With `global_weighted_round_robin: true`, the plugin deliberately ignores group even when CPA propagates it, then schedules by Weight across every current provider/model candidate.
 
 **Custom classification** (Web UI → Mapping → Credential Classification):
 
@@ -130,11 +131,14 @@ plugins:
       enabled: true
       priority: 10
       state_file: "cpa-key-policy-state.json"
+      global_weighted_round_robin: true
 ```
 
 Notes:
 
 - If `state_file` exists, it is the source of truth for keys / aliases / classify rules / usage.
+- `global_weighted_round_robin: true` ignores the selected alias target group and places every current provider/model candidate in one global pool. Distribution then follows the Weight values on CPA's credential page. The default is `false`.
+- With this option enabled, alias-level group rotation no longer restricts the final credential. Native CPA keys remain unaffected.
 - Prefer creating keys and aliases in the **Web UI** or Management API; seed YAML `keys` is mainly for first boot.
 - Never commit real key hashes, management secrets, or live host URLs into public docs.
 

@@ -118,6 +118,7 @@ func (a *App) registration() Registration {
 			ConfigFields: []ConfigField{
 				{Name: "enabled", Type: "boolean", Description: "Enable or disable this plugin without unloading it."},
 				{Name: "state_file", Type: "string", Description: "JSON state file used for key policy changes made through the Management API."},
+				{Name: "global_weighted_round_robin", Type: "boolean", Description: "忽略别名目标的 group，对当前 provider/model 的全部候选凭证执行全局加权轮询。"},
 				{Name: "keys", Type: "array", Description: "Initial downstream key policy list. State file wins after it exists."},
 			},
 		},
@@ -268,7 +269,14 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	group := schedulerGroupFromMetadata(req.Options.Metadata)
-	if group == "" && !a.store.OwnsRequestKey(http.Header(req.Options.Headers)) {
+	globalMode := a.store.GlobalWeightedRoundRobin()
+	if globalMode {
+		if !a.store.OwnsRequestKey(http.Header(req.Options.Headers)) {
+			// 全局模式仅接管插件自有密钥，原生密钥仍由 CPA 调度。
+			return OKEnvelope(SchedulerPickResponse{Handled: false})
+		}
+		group = ""
+	} else if group == "" && !a.store.OwnsRequestKey(http.Header(req.Options.Headers)) {
 		// 无组兼容路径只能影响插件自己的密钥，原生密钥仍由 CPA 调度。
 		return OKEnvelope(SchedulerPickResponse{Handled: false})
 	}
@@ -503,6 +511,8 @@ func (a *App) managementRegistration() ManagementRegistrationResponse {
 			{Method: http.MethodPost, Path: base + "/keys/reset-rpm", Description: "Reset one downstream CPA key RPM counter by id."},
 			{Method: http.MethodGet, Path: base + "/keys/usage", Description: "Per-alias usage breakdown for one downstream CPA key by id."},
 			{Method: http.MethodGet, Path: base + "/status", Description: "Show cpa-key-policy runtime status."},
+			{Method: http.MethodGet, Path: base + "/settings", Description: "Show scheduler settings."},
+			{Method: http.MethodPatch, Path: base + "/settings", Description: "Update scheduler settings."},
 			{Method: http.MethodGet, Path: base + "/aliases", Description: "List the global alias mapping table."},
 			{Method: http.MethodPost, Path: base + "/aliases", Description: "Create or update a global alias mapping."},
 			{Method: http.MethodDelete, Path: base + "/aliases", Description: "Delete a global alias mapping by name."},
@@ -552,6 +562,10 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 		return OKEnvelope(a.keyUsage(idFromRequest(req.Query, req.Body)))
 	case req.Method == http.MethodGet && path == base+"/status":
 		return OKEnvelope(jsonResponse(http.StatusOK, a.store.Status()))
+	case req.Method == http.MethodGet && path == base+"/settings":
+		return OKEnvelope(a.schedulerSettings())
+	case req.Method == http.MethodPatch && path == base+"/settings":
+		return OKEnvelope(a.updateSchedulerSettings(req.Body))
 	case req.Method == http.MethodGet && path == base+"/aliases":
 		return OKEnvelope(jsonResponse(http.StatusOK, map[string]any{"aliases": a.store.AliasesSnapshot()}))
 	case req.Method == http.MethodPost && path == base+"/aliases":
@@ -573,6 +587,31 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 	default:
 		return OKEnvelope(jsonError(http.StatusNotFound, "not_found", "unknown management route"))
 	}
+}
+
+type schedulerSettingsRequest struct {
+	GlobalWeightedRoundRobin *bool `json:"global_weighted_round_robin"`
+}
+
+func (a *App) schedulerSettings() ManagementResponse {
+	return jsonResponse(http.StatusOK, map[string]any{
+		"global_weighted_round_robin": a.store.GlobalWeightedRoundRobin(),
+	})
+}
+
+func (a *App) updateSchedulerSettings(body []byte) ManagementResponse {
+	var request schedulerSettingsRequest
+	if err := json.Unmarshal(body, &request); err != nil {
+		return jsonError(http.StatusBadRequest, "invalid_json", err.Error())
+	}
+	if request.GlobalWeightedRoundRobin == nil {
+		return jsonError(http.StatusBadRequest, "missing_setting", "缺少 global_weighted_round_robin 设置")
+	}
+	if err := a.store.SetGlobalWeightedRoundRobin(*request.GlobalWeightedRoundRobin); err != nil {
+		return jsonError(http.StatusInternalServerError, "settings_persist_failed", "保存调度设置失败: "+err.Error())
+	}
+	a.clearSchedulerState()
+	return a.schedulerSettings()
 }
 
 type keyWriteRequest struct {
