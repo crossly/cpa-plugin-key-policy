@@ -8,15 +8,17 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"cpa-key-policy/internal/plugin/web"
 	"cpa-key-policy/internal/policy"
 )
 
 type App struct {
-	store         *policy.Store
-	classifyMu    sync.RWMutex
-	classifyCache map[string][]string
+	store             *policy.Store
+	hostSchemaVersion atomic.Uint32
+	classifyMu        sync.RWMutex
+	classifyCache     map[string][]string
 }
 
 const classifyCacheCapacity = 4096
@@ -46,6 +48,10 @@ func (a *App) handleMethod(method string, request []byte) ([]byte, error) {
 		return a.authenticate(request)
 	case MethodModelRoute:
 		return a.routeModel(request)
+	case MethodRequestInterceptBefore:
+		return a.interceptRequestBefore(request)
+	case MethodRequestInterceptAfter:
+		return a.interceptRequestAfter(request)
 	case MethodSchedulerPick:
 		return a.pickScheduler(request)
 	case MethodResponseInterceptAfter:
@@ -85,6 +91,13 @@ func (a *App) configure(raw []byte) error {
 	if err := a.store.Configure(cfg); err != nil {
 		return err
 	}
+	if req.SchemaVersion == 0 {
+		req.SchemaVersion = a.hostSchemaVersion.Load()
+		if req.SchemaVersion == 0 {
+			req.SchemaVersion = 1
+		}
+	}
+	a.hostSchemaVersion.Store(req.SchemaVersion)
 	// Register the classify cache clear callback, then clear once for safety.
 	a.store.SetOnClassifyRulesChanged(func() {
 		a.clearClassifyCache()
@@ -100,8 +113,13 @@ func (a *App) Shutdown() {
 }
 
 func (a *App) registration() Registration {
+	requestInterceptor := a.requestInterceptorSupported()
+	schemaVersion := uint32(1)
+	if requestInterceptor {
+		schemaVersion = SchemaVersion
+	}
 	return Registration{
-		SchemaVersion: SchemaVersion,
+		SchemaVersion: schemaVersion,
 		Metadata: Metadata{
 			Name:             PluginName,
 			Version:          Version,
@@ -118,6 +136,7 @@ func (a *App) registration() Registration {
 			FrontendAuthProviderExclusive: false,
 			ModelRouter:                   true,
 			Scheduler:                     true,
+			RequestInterceptor:            requestInterceptor,
 			ResponseInterceptor:           true,
 			UsagePlugin:                   true,
 			ManagementAPI:                 true,
@@ -131,7 +150,7 @@ func (a *App) authenticate(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	decision := a.store.Authenticate(req.Method, req.Path, req.Headers, req.Query, req.Body)
-	if !decision.Known || !decision.Allowed {
+	if !decision.Known || (!decision.Allowed && !a.canPassQuotaToInterceptor(req, decision)) {
 		return OKEnvelope(FrontendAuthResponse{Authenticated: false})
 	}
 	meta := map[string]string{

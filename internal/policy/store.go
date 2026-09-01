@@ -3,6 +3,7 @@ package policy
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"sort"
@@ -297,28 +298,36 @@ func (s *Store) Authenticate(method, path string, headers http.Header, query map
 		decision.Rule = rule
 	}
 	limiter, usageLedger := s.runtimeComponents()
+	// Dollar usage limit check (daily / weekly). Only enforced when a limit is
+	// set (>0). This is a pre-request gate; the request that pushes usage over
+	// the limit is allowed through, and the next request is rejected. Check this
+	// before RPM so repeated quota failures remain quota failures and do not
+	// consume the request-rate bucket.
+	if usageLedger != nil {
+		if reason, _ := usageLedger.OverLimit(*key); reason != "" {
+			decision.CostLimited = true
+			decision.Reason = reason
+			// The request is allowed through frontend auth only so the request
+			// interceptor can emit the direct response. Preserve the selected
+			// multi-target rule for model.route before that interceptor runs.
+			if requested != "" {
+				s.rememberPick(key.ID, requested, decision.Rule)
+			}
+			return decision
+		}
+	}
 	if limiter != nil && !limiter.Allow(key.ID, key.RPM) {
 		decision.RateLimited = true
 		decision.Reason = "rpm_exceeded"
 		return decision
 	}
-	// Dollar usage limit check (daily / weekly). Only enforced when a limit is
-	// set (>0). This is a pre-request gate; the request that pushes usage over
-	// the limit is allowed through, and the next request is rejected — matching
-	// the RPM limiter's "off-by-one" semantics.
-	if usageLedger != nil {
-		if reason, _ := usageLedger.OverLimit(*key); reason != "" {
-			decision.CostLimited = true
-			decision.Reason = reason
-			return decision
-		}
-	}
 	decision.Allowed = true
 	decision.Reason = "allowed"
 
 	// Remember this request's selected target so Route reuses it (same group /
-	// provider / model). Only stash when the request is actually allowed — a
-	// rate/cost-limited request never reaches model.route.
+	// provider / model). Quota-blocked requests are remembered above because
+	// they pass through routing before the request interceptor terminates them;
+	// other rejected requests never reach model.route.
 	if requested != "" {
 		s.rememberPick(key.ID, requested, decision.Rule)
 	}
@@ -655,6 +664,46 @@ func (s *Store) UsageSummaryFor(key KeyConfig) UsageSummary {
 		return UsageSummary{DailyLimitUSD: key.DailyLimitUSD, WeeklyLimitUSD: key.WeeklyLimitUSD}
 	}
 	return usage.Summary(key)
+}
+
+// QuotaForAPIKey returns the current quota decision for a managed, enabled
+// downstream key. It is intentionally read-only: request admission and usage
+// accounting remain separate. retryAfterSeconds is the number of seconds until
+// the offending daily/weekly window resets, rounded up for Retry-After.
+func (s *Store) QuotaForAPIKey(raw string) (reason string, summary UsageSummary, retryAfterSeconds int, ok bool) {
+	if !s.Enabled() {
+		return "", UsageSummary{}, 0, false
+	}
+	key := s.findBySecret(raw)
+	if key == nil || !key.Enabled {
+		return "", UsageSummary{}, 0, false
+	}
+	_, usage := s.runtimeComponents()
+	if usage == nil {
+		return "", UsageSummary{
+			DailyLimitUSD:  key.DailyLimitUSD,
+			WeeklyLimitUSD: key.WeeklyLimitUSD,
+		}, 0, true
+	}
+
+	reason, summary = usage.OverLimit(*key)
+	if reason == "" {
+		return "", summary, 0, true
+	}
+	resetAt := summary.DailyResetAt
+	if reason == "weekly_exceeded" {
+		resetAt = summary.WeeklyResetAt
+	}
+	if !resetAt.IsZero() {
+		seconds := resetAt.Sub(usage.now()).Seconds()
+		if seconds > 0 {
+			retryAfterSeconds = int(math.Ceil(seconds))
+			if retryAfterSeconds < 1 {
+				retryAfterSeconds = 1
+			}
+		}
+	}
+	return reason, summary, retryAfterSeconds, true
 }
 
 // ResetUsage clears in-memory usage for a key (manual quota unlock).

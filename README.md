@@ -84,6 +84,7 @@ Channels under CPA `openai-compatibility` (e.g. a named proxy) use the **channel
 | Frontend auth | Know plugin keys; enforce alias allow-list, RPM, budget; stamp route + group metadata |
 | Model router | Alias → provider + target model |
 | Scheduler | When `group` is set, filter auth candidates by tier / `classify:` group |
+| Request interceptor | OpenAI-compatible daily/weekly quota rejection before upstream auth |
 | Response interceptor | Non-stream JSON: rewrite top-level `model` back to the alias |
 | Usage | Token / per-call billing into the state file |
 | Management API + embedded Web UI | Keys, aliases, classify rules, status |
@@ -225,11 +226,38 @@ curl -X POST "$CPA/v0/management/plugins/cpa-key-policy/aliases" \
 |------|--------|
 | Known key + allowed alias | Auth OK → route → optional group filter → upstream |
 | Known key + unknown model | Auth rejected |
-| RPM / budget exceeded | Rejected |
+| RPM exceeded | Rejected with HTTP 429 (`rate_limit_error` / `rate_limit_exceeded`) |
+| Daily / weekly budget exceeded | OpenAI-compatible path: HTTP 429 with dynamic `insufficient_quota` JSON, usage/limit/reset details, and `Retry-After` |
 | Group set, no matching auth file | `auth_not_found` / unavailable (no cross-tier leak) |
 | Unknown key | Plugin declines; CPA may try native `api-keys` |
 | Non-stream chat response | Top-level `model` rewritten to alias |
 | Stream | Body not rewritten (v1) |
+
+For OpenAI-compatible paths, a daily or weekly budget rejection is emitted by
+the request interceptor before upstream auth selection:
+
+```http
+HTTP/1.1 429 Too Many Requests
+Content-Type: application/json
+Retry-After: 50400
+```
+
+```json
+{
+  "error": {
+    "message": "Daily quota exceeded. Usage: $10.00 / $10.00 USD. Resets at 2026-09-03T00:00:00Z.",
+    "type": "insufficient_quota",
+    "param": null,
+    "code": "daily_quota_exceeded"
+  }
+}
+```
+
+The usage, limit, reset timestamp, window, and `Retry-After` value are
+calculated from the current key ledger. This requires a CPA host that
+negotiates plugin protocol schema 2 or later; older hosts keep the previous
+fail-closed authentication behavior.
+
 
 ### `/v1/models` on CPA main port
 

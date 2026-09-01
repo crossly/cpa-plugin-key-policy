@@ -75,6 +75,24 @@ func TestUsageRecordAndOverLimitDaily(t *testing.T) {
 	}
 }
 
+func TestQuotaForAPIKeyReturnsDailyWindowDetails(t *testing.T) {
+	now := time.Date(2026, 9, 2, 10, 0, 0, 0, time.UTC)
+	store, _ := newClockedStore(t, now)
+	headers := http.Header{"Authorization": {"Bearer cpa_usage"}}
+
+	store.RecordResponseCost(headers, nil, "fast", []byte(`{"usage":{"prompt_tokens":1000000,"completion_tokens":0}}`))
+	reason, summary, retryAfter, ok := store.QuotaForAPIKey("cpa_usage")
+	if !ok || reason != "daily_exceeded" {
+		t.Fatalf("quota status = reason=%q ok=%v, want daily_exceeded/true", reason, ok)
+	}
+	if summary.DailyUSD != 1 || summary.DailyLimitUSD != 1 || summary.DailyResetAt.Format(time.RFC3339) != "2026-09-03T00:00:00Z" {
+		t.Fatalf("summary = %+v, want daily usage/limit/reset", summary)
+	}
+	if retryAfter != 50400 {
+		t.Fatalf("retry after = %d, want 50400", retryAfter)
+	}
+}
+
 func TestUsageUnlimitedKeyNeverBlocked(t *testing.T) {
 	now := time.Date(2026, 6, 29, 10, 0, 0, 0, time.UTC)
 	store := NewStore()

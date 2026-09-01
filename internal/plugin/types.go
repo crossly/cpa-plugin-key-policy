@@ -7,8 +7,9 @@ import (
 )
 
 const (
-	ABIVersion    uint32 = 1
-	SchemaVersion uint32 = 1
+	ABIVersion uint32 = 1
+	// SchemaVersion 2 enables request interceptor termination responses.
+	SchemaVersion uint32 = 2
 
 	MethodPluginRegister    = "plugin.register"
 	MethodPluginReconfigure = "plugin.reconfigure"
@@ -19,6 +20,12 @@ const (
 	MethodModelRoute = "model.route"
 
 	MethodResponseInterceptAfter = "response.intercept_after"
+
+	// MethodRequestInterceptBefore and MethodRequestInterceptAfter are host
+	// callbacks around upstream auth selection. The before hook can terminate
+	// a request with a plugin-owned HTTP response.
+	MethodRequestInterceptBefore = "request.intercept_before"
+	MethodRequestInterceptAfter  = "request.intercept_after"
 
 	// MethodSchedulerPick is the host->plugin call that asks this plugin to
 	// choose an auth candidate among those available for a routed provider,
@@ -43,7 +50,7 @@ const (
 const (
 	PluginID   = "cpa-key-policy"
 	PluginName = "cpa-key-policy"
-	Version    = "0.4.4"
+	Version    = "0.4.5"
 )
 
 type Envelope struct {
@@ -60,7 +67,8 @@ type EnvelopeError struct {
 }
 
 type LifecycleRequest struct {
-	ConfigYAML []byte `json:"config_yaml"`
+	ConfigYAML    []byte `json:"config_yaml"`
+	SchemaVersion uint32 `json:"schema_version,omitempty"`
 }
 
 type Registration struct {
@@ -90,6 +98,7 @@ type Capabilities struct {
 	FrontendAuthProviderExclusive bool `json:"frontend_auth_provider_exclusive,omitempty"`
 	ModelRouter                   bool `json:"model_router"`
 	Scheduler                     bool `json:"scheduler,omitempty"`
+	RequestInterceptor            bool `json:"request_interceptor,omitempty"`
 	ResponseInterceptor           bool `json:"response_interceptor"`
 	UsagePlugin                   bool `json:"usage_plugin"`
 	ManagementAPI                 bool `json:"management_api"`
@@ -130,6 +139,35 @@ type ModelRouteResponse struct {
 	Target      string `json:"Target,omitempty"`
 	TargetModel string `json:"TargetModel,omitempty"`
 	Reason      string `json:"Reason,omitempty"`
+}
+
+// RequestInterceptRequest is the host payload for request.intercept_*.
+// It mirrors CPA's request interceptor contract. The before-auth hook is
+// used here to return a direct downstream quota error before upstream auth
+// selection or execution begins.
+type RequestInterceptRequest struct {
+	RequestID      string         `json:"RequestID"`
+	TraceID        string         `json:"TraceID"`
+	SourceFormat   string         `json:"SourceFormat"`
+	ToFormat       string         `json:"ToFormat"`
+	Model          string         `json:"Model"`
+	RequestedModel string         `json:"RequestedModel"`
+	Stream         bool           `json:"Stream"`
+	Headers        http.Header    `json:"Headers"`
+	Body           []byte         `json:"Body"`
+	Metadata       map[string]any `json:"Metadata"`
+}
+
+// RequestInterceptResponse returns request changes or a direct downstream
+// response when Terminate is true.
+type RequestInterceptResponse struct {
+	Headers         http.Header `json:"Headers,omitempty"`
+	Body            []byte      `json:"Body,omitempty"`
+	ClearHeaders    []string    `json:"ClearHeaders,omitempty"`
+	Terminate       bool        `json:"Terminate,omitempty"`
+	StatusCode      int         `json:"StatusCode,omitempty"`
+	ResponseHeaders http.Header `json:"ResponseHeaders,omitempty"`
+	ResponseBody    []byte      `json:"ResponseBody,omitempty"`
 }
 
 // SchedulerPickRequest is the payload of the host->plugin scheduler.pick call.

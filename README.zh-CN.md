@@ -82,6 +82,7 @@ CPA 里配置的兼容通道，映射时 `provider` 填通道 **name**。插件�
 | 前端鉴权 | 识别插件 key；校验别名、RPM、额度；写入路由与 group 元数据 |
 | 模型路由 | 别名 → provider + 目标模型 |
 | 调度 | 有 group 时按档位 / `classify:` 过滤凭证 |
+| 请求拦截 | OpenAI 兼容路径在上游鉴权前返回日/周额度错误 |
 | 响应拦截 | 非流式 JSON：把顶层 `model` 改回别名 |
 | 用量 | token / 按次计费写入 state |
 | 管理 API + 内嵌网页 | Key、别名、归类、状态 |
@@ -212,11 +213,34 @@ curl -X POST "$CPA/v0/management/plugins/cpa-key-policy/aliases" \
 |------|------|
 | 认识的 key + 允许的别名 | 鉴权通过 → 路由 → 可选 group 过滤 → 上游 |
 | 不允许的模型名 | 鉴权失败 |
-| 超 RPM / 额度 | 拒绝 |
+| 超 RPM | HTTP 429（`rate_limit_error` / `rate_limit_exceeded`）拒绝 |
+| 超每日 / 每周美元额度 | OpenAI 兼容路径返回 HTTP 429，动态返回 `insufficient_quota` JSON、当前用量/上限/重置时间及 `Retry-After` |
 | 写了 group 但组内无可用凭证 | `auth_not_found` / 不可用（不串档） |
 | 不认识的 key | 插件放弃，CPA 可尝试原生 `api-keys` |
 | 非流式对话响应 | 顶层 `model` 改回别名 |
 | 流式 | v1 不改写 body |
+
+在 OpenAI 兼容路径上，日/周额度超限会在上游鉴权选择前由请求拦截器直接返回：
+
+```http
+HTTP/1.1 429 Too Many Requests
+Content-Type: application/json
+Retry-After: 50400
+```
+
+```json
+{
+  "error": {
+    "message": "Daily quota exceeded. Usage: $10.00 / $10.00 USD. Resets at 2026-09-03T00:00:00Z.",
+    "type": "insufficient_quota",
+    "param": null,
+    "code": "daily_quota_exceeded"
+  }
+}
+```
+
+响应中的当前用量、额度上限、重置时间、额度窗口和 `Retry-After` 均来自当前 key 的实时 ledger。该行为要求 CPA 主程序协商到插件协议 schema 2 或更高版本；旧版主程序保持原有的 fail-closed 鉴权行为。
+
 
 ### 主端口的 `/v1/models`
 
