@@ -319,6 +319,9 @@ func (s *Store) Authenticate(method, path string, headers http.Header, query map
 	if limiter != nil && !limiter.Allow(key.ID, key.RPM) {
 		decision.RateLimited = true
 		decision.Reason = "rpm_exceeded"
+		if requested != "" {
+			s.rememberPick(key.ID, requested, decision.Rule)
+		}
 		return decision
 	}
 	decision.Allowed = true
@@ -704,6 +707,25 @@ func (s *Store) QuotaForAPIKey(raw string) (reason string, summary UsageSummary,
 		}
 	}
 	return reason, summary, retryAfterSeconds, true
+}
+
+// RateLimitForAPIKey reports the current RPM decision for a managed, enabled
+// downstream key without consuming another request. It returns the configured
+// RPM so the request interceptor can describe the limit precisely.
+func (s *Store) RateLimitForAPIKey(raw string) (blocked bool, retryAfterSeconds, rpm int, ok bool) {
+	if !s.Enabled() {
+		return false, 0, 0, false
+	}
+	key := s.findBySecret(raw)
+	if key == nil || !key.Enabled {
+		return false, 0, 0, false
+	}
+	limiter, _ := s.runtimeComponents()
+	if limiter == nil {
+		return false, 0, key.RPM, true
+	}
+	blocked, retryAfterSeconds = limiter.Status(key.ID, key.RPM)
+	return blocked, retryAfterSeconds, key.RPM, true
 }
 
 // ResetUsage clears in-memory usage for a key (manual quota unlock).

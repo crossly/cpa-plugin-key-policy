@@ -150,7 +150,7 @@ func (a *App) authenticate(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	decision := a.store.Authenticate(req.Method, req.Path, req.Headers, req.Query, req.Body)
-	if !decision.Known || (!decision.Allowed && !a.canPassQuotaToInterceptor(req, decision)) {
+	if !decision.Known || (!decision.Allowed && !a.canPassPolicyDenialToInterceptor(req, decision)) {
 		return OKEnvelope(FrontendAuthResponse{Authenticated: false})
 	}
 	meta := map[string]string{

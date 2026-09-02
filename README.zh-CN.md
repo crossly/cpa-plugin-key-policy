@@ -213,8 +213,8 @@ curl -X POST "$CPA/v0/management/plugins/cpa-key-policy/aliases" \
 |------|------|
 | 认识的 key + 允许的别名 | 鉴权通过 → 路由 → 可选 group 过滤 → 上游 |
 | 不允许的模型名 | 鉴权失败 |
-| 超 RPM | HTTP 429（`rate_limit_error` / `rate_limit_exceeded`）拒绝 |
-| 超每日 / 每周美元额度 | OpenAI 兼容路径返回 HTTP 429，动态返回 `insufficient_quota` JSON、当前用量/上限/重置时间及 `Retry-After` |
+| 超 RPM | 按请求原生协议返回 HTTP 429（OpenAI 兼容请求为 `rate_limit_error` / `rate_limit_exceeded`） |
+| 超每日 / 每周美元额度 | 返回 HTTP 429；OpenAI 兼容路径使用动态 `insufficient_quota` JSON，Claude/Gemini 路径保留原生错误封装 |
 | 写了 group 但组内无可用凭证 | `auth_not_found` / 不可用（不串档） |
 | 不认识的 key | 插件放弃，CPA 可尝试原生 `api-keys` |
 | 非流式对话响应 | 顶层 `model` 改回别名 |
@@ -244,7 +244,7 @@ Retry-After: 50400
 
 ### 主端口的 `/v1/models`
 
-每 key 的 `allow_models_endpoint` 是**开关**：拒绝（401）或看**全局完整列表**。主端口无法按插件 key 过滤列表。
+每 key 的 `allow_models_endpoint` 是**开关**：拒绝（401）或看**全局完整列表**。主端口无法按插件 key 过滤列表。被拒绝但已知的 key 仍然是有效 key；当前 401 是 CPA 前端鉴权协议的限制，因为该端点不经过执行/请求拦截链。要返回准确的 403，需要主程序支持明确的鉴权拒绝响应。
 
 
 ---

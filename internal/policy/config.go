@@ -47,8 +47,9 @@ type KeyConfig struct {
 	// returns the global registry and never goes through an executor or
 	// response interceptor, and the access hook can only 401/allow — not
 	// rewrite the body). So the only per-key control we can enforce at the
-	// plugin layer is the binary choice: 401 (hide the list entirely) or
-	// allow (client sees the full global list). Default false = 401.
+	// plugin layer is the binary choice: deny (which CPA exposes as its generic
+	// authentication rejection) or allow (client sees the full global list).
+	// Default false = deny safely; it does not mean the downstream key is invalid.
 	AllowModelsEndpoint bool    `yaml:"allow_models_endpoint,omitempty" json:"allow_models_endpoint,omitempty"`
 	DailyLimitUSD       float64 `yaml:"daily_limit_usd,omitempty" json:"daily_limit_usd,omitempty"`
 	// WeeklyLimitUSD caps the dollar usage over a rolling 7-day window. 0 = unlimited.

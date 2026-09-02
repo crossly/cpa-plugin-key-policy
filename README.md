@@ -226,8 +226,8 @@ curl -X POST "$CPA/v0/management/plugins/cpa-key-policy/aliases" \
 |------|--------|
 | Known key + allowed alias | Auth OK → route → optional group filter → upstream |
 | Known key + unknown model | Auth rejected |
-| RPM exceeded | Rejected with HTTP 429 (`rate_limit_error` / `rate_limit_exceeded`) |
-| Daily / weekly budget exceeded | OpenAI-compatible path: HTTP 429 with dynamic `insufficient_quota` JSON, usage/limit/reset details, and `Retry-After` |
+| RPM exceeded | Rejected with HTTP 429 in the request's native protocol format (`rate_limit_error` / `rate_limit_exceeded` for OpenAI-compatible requests) |
+| Daily / weekly budget exceeded | Rejected with HTTP 429; OpenAI-compatible paths use dynamic `insufficient_quota` JSON, while Claude/Gemini paths keep their native error envelope |
 | Group set, no matching auth file | `auth_not_found` / unavailable (no cross-tier leak) |
 | Unknown key | Plugin declines; CPA may try native `api-keys` |
 | Non-stream chat response | Top-level `model` rewritten to alias |
@@ -261,7 +261,7 @@ fail-closed authentication behavior.
 
 ### `/v1/models` on CPA main port
 
-Per-key `allow_models_endpoint`: **binary** — deny (401) or full global list. CPA cannot filter that list per plugin key on the main port.
+Per-key `allow_models_endpoint`: **binary** — deny (401) or full global list. CPA cannot filter that list per plugin key on the main port. A denied, known key is still a valid key; the generic 401 is a CPA frontend-auth limitation because this endpoint bypasses the execution/request-interceptor chain. A precise 403 requires host-level support for explicit auth denials.
 
 
 ---

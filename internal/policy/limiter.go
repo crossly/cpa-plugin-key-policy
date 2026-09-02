@@ -51,6 +51,34 @@ func (l *RateLimiter) Allow(id string, rpm int) bool {
 	return true
 }
 
+// Status reports whether an id is currently at its RPM ceiling without
+// consuming another request. The returned seconds are rounded up for a
+// Retry-After header.
+func (l *RateLimiter) Status(id string, rpm int) (blocked bool, retryAfterSeconds int) {
+	if l == nil || rpm <= 0 {
+		return false, 0
+	}
+	now := l.now().UTC()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	bucket, ok := l.buckets[id]
+	if !ok || bucket.windowStart.IsZero() || now.Before(bucket.windowStart) || now.Sub(bucket.windowStart) >= time.Minute {
+		return false, 0
+	}
+	if bucket.count < rpm {
+		return false, 0
+	}
+	remaining := time.Minute - now.Sub(bucket.windowStart)
+	seconds := int(remaining / time.Second)
+	if remaining%time.Second != 0 {
+		seconds++
+	}
+	if seconds < 1 {
+		seconds = 1
+	}
+	return true, seconds
+}
+
 func (l *RateLimiter) Reset(id string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
