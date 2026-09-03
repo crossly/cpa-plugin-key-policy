@@ -60,6 +60,15 @@ Two sources of “which auth file may serve this request”:
 
 **Runtime rule:** if a mapping sets a group, the plugin scheduler **only** picks auth files in that group. No match → hard failure (`auth_not_found`), never silently fall back to another tier.
 
+**Scheduling:** the plugin keeps the highest available `Priority` tier, then applies **smooth weighted round-robin** using each credential's `weight`:
+
+- Weight is read from the CPA credential candidate's `Weight`, `Attributes.weight`, or `Metadata.weight` field.
+- Missing or invalid weight defaults to `1`; non-positive weight stops new requests; values are capped at `1000000`.
+- State is shared globally by `provider + model + group + Priority`, so all downstream `cpa_…` keys contribute to one distribution. An empty group is one global pool containing every candidate CPA offers for that provider/model.
+- Lower-priority credentials participate only when every higher-priority credential is unavailable or has non-positive weight.
+- When CPA does not propagate frontend-auth group metadata (including CPA `7.2.140`), plugin-owned keys still use global weighted round-robin instead of falling back to CPA's `routing.strategy`; native CPA keys remain untouched.
+- With `global_weighted_round_robin: true`, the plugin deliberately ignores group even when CPA propagates it, then schedules by Weight across every current provider/model candidate.
+
 **Custom classification** (Web UI → Mapping → Credential Classification):
 
 - Match auth-file fields (`filename`, `provider`, `plan_type`, `tier`, …) with a regex.
@@ -83,7 +92,7 @@ Channels under CPA `openai-compatibility` (e.g. a named proxy) use the **channel
 |------|------|
 | Frontend auth | Know plugin keys; enforce alias allow-list, RPM, budget; stamp route + group metadata |
 | Model router | Alias → provider + target model |
-| Scheduler | When `group` is set, filter auth candidates by tier / `classify:` group |
+| Scheduler | Optionally filter candidates by `group`, then smooth-weight them within the highest Priority tier |
 | Response interceptor | Non-stream JSON: rewrite top-level `model` back to the alias |
 | Usage | Token / per-call billing into the state file |
 | Management API + embedded Web UI | Keys, aliases, classify rules, status |
@@ -122,11 +131,14 @@ plugins:
       enabled: true
       priority: 10
       state_file: "cpa-key-policy-state.json"
+      global_weighted_round_robin: true
 ```
 
 Notes:
 
 - If `state_file` exists, it is the source of truth for keys / aliases / classify rules / usage.
+- `global_weighted_round_robin: true` ignores the selected alias target group and places every current provider/model candidate in one global pool. Distribution then follows the Weight values on CPA's credential page. The default is `false`.
+- With this option enabled, alias-level group rotation no longer restricts the final credential. Native CPA keys remain unaffected.
 - Prefer creating keys and aliases in the **Web UI** or Management API; seed YAML `keys` is mainly for first boot.
 - Never commit real key hashes, management secrets, or live host URLs into public docs.
 

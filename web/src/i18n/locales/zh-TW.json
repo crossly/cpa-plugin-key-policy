@@ -190,5 +190,10 @@
       "tokenMix": "Token 構成",
       "last7Days": "最近 7 天"
     }
+  },
+  "mapping": {
+    "globalWeighted": "全域加權輪詢",
+    "globalWeightedTitle": "開啟後忽略別名目標的 group，依 CPA 憑證 Weight 進行全域加權輪詢",
+    "globalWeightedSaveFailed": "儲存全域加權設定失敗"
   }
 }

@@ -5,35 +5,154 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
-func TestSchedulerPickNoGroupDefers(t *testing.T) {
-	app, _ := configureTestApp(t)
-	req, _ := json.Marshal(SchedulerPickRequest{
+func TestSchedulerPickNoGroupUsesGlobalWeightedRoundRobin(t *testing.T) {
+	app, plain := configureTestApp(t)
+	request := SchedulerPickRequest{
 		Provider: "codex",
 		Model:    "gpt-5-codex",
-		Options:  SchedulerPickOptions{Metadata: map[string]any{}},
-		Candidates: []SchedulerAuthCandidate{
-			{ID: "codex-a-free", Provider: "codex", Attributes: map[string]string{"plan_type": "free"}},
-			{ID: "codex-b-team", Provider: "codex", Attributes: map[string]string{"plan_type": "team"}},
+		Options: SchedulerPickOptions{
+			Headers:  map[string][]string{"Authorization": {"Bearer " + plain}},
+			Metadata: map[string]any{},
 		},
-	})
-	raw, err := app.HandleMethod(MethodSchedulerPick, req)
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "codex-plus", Provider: "codex", Weight: 4, Attributes: map[string]string{"plan_type": "plus"}},
+			{ID: "codex-prolite", Provider: "codex", Weight: 1, Attributes: map[string]string{"plan_type": "prolite"}},
+		},
+	}
+
+	counts := map[string]int{}
+	for index := 0; index < 10; index++ {
+		resp := schedulerPickForTest(t, app, request)
+		counts[resp.AuthID]++
+	}
+	if counts["codex-plus"] != 8 || counts["codex-prolite"] != 2 {
+		t.Fatalf("期望无组时在全部凭证中按 4:1 分配，实际为 %v", counts)
+	}
+}
+
+func TestSchedulerPickNoGroupDefersNativeKey(t *testing.T) {
+	app, _ := configureTestApp(t)
+	request := SchedulerPickRequest{
+		Provider: "codex",
+		Model:    "gpt-5-codex",
+		Options: SchedulerPickOptions{
+			Headers: map[string][]string{"Authorization": {"Bearer native-key"}},
+		},
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "codex-a", Provider: "codex", Weight: 4},
+			{ID: "codex-b", Provider: "codex", Weight: 1},
+		},
+	}
+
+	rawRequest, err := json.Marshal(request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var env Envelope
-	if err := json.Unmarshal(raw, &env); err != nil {
+	rawResponse, err := app.HandleMethod(MethodSchedulerPick, rawRequest)
+	if err != nil {
 		t.Fatal(err)
 	}
-	var resp SchedulerPickResponse
-	if err := json.Unmarshal(env.Result, &resp); err != nil {
+	var response SchedulerPickResponse
+	if err := unmarshalOK(rawResponse, &response); err != nil {
 		t.Fatal(err)
 	}
-	if resp.Handled {
-		t.Fatalf("expected Handled=false when no group, got %+v", resp)
+	if response.Handled {
+		t.Fatalf("原生密钥不应被插件的无组调度接管，实际为 %+v", response)
 	}
+}
+
+func TestSchedulerPickGlobalModeIgnoresReceivedGroup(t *testing.T) {
+	app, plain := configureGlobalSchedulerApp(t)
+	request := SchedulerPickRequest{
+		Provider: "codex",
+		Model:    "gpt-5-codex",
+		Options: SchedulerPickOptions{
+			Headers:  map[string][]string{"Authorization": {"Bearer " + plain}},
+			Metadata: map[string]any{"group": "plus"},
+		},
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "codex-plus", Provider: "codex", Weight: 4, Attributes: map[string]string{"plan_type": "plus"}},
+			{ID: "codex-prolite", Provider: "codex", Weight: 1, Attributes: map[string]string{"plan_type": "prolite"}},
+		},
+	}
+
+	counts := map[string]int{}
+	for index := 0; index < 10; index++ {
+		response := schedulerPickForTest(t, app, request)
+		counts[response.AuthID]++
+	}
+	if counts["codex-plus"] != 8 || counts["codex-prolite"] != 2 {
+		t.Fatalf("开启全局模式后应忽略 group 并按 4:1 分配，实际为 %v", counts)
+	}
+}
+
+func TestSchedulerPickGlobalModeDefersNativeKey(t *testing.T) {
+	app, _ := configureGlobalSchedulerApp(t)
+	request := SchedulerPickRequest{
+		Provider: "codex",
+		Model:    "gpt-5-codex",
+		Options: SchedulerPickOptions{
+			Headers:  map[string][]string{"Authorization": {"Bearer native-key"}},
+			Metadata: map[string]any{"group": "plus"},
+		},
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "codex-plus", Provider: "codex", Weight: 4, Attributes: map[string]string{"plan_type": "plus"}},
+			{ID: "codex-prolite", Provider: "codex", Weight: 1, Attributes: map[string]string{"plan_type": "prolite"}},
+		},
+	}
+
+	rawRequest, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawResponse, err := app.HandleMethod(MethodSchedulerPick, rawRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response SchedulerPickResponse
+	if err := unmarshalOK(rawResponse, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Handled {
+		t.Fatalf("全局模式不应接管 CPA 原生密钥，实际为 %+v", response)
+	}
+}
+
+func configureGlobalSchedulerApp(t *testing.T) (*App, string) {
+	t.Helper()
+	app := NewApp()
+	plain := "cpa_global_weighted_test"
+	hash := hashForTest(t, plain)
+	configYAML := []byte(`
+enabled: true
+global_weighted_round_robin: true
+state_file: "` + filepath.ToSlash(filepath.Join(t.TempDir(), "state.json")) + `"
+keys:
+  - id: global-weighted
+    name: Global Weighted
+    enabled: true
+    key_hash: "` + hash + `"
+    key_preview: "cpa_glo..._test"
+    models:
+      - alias: fast
+        provider: codex
+        target_model: gpt-5-codex
+`)
+	request, err := json.Marshal(LifecycleRequest{ConfigYAML: configYAML})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.HandleMethod(MethodPluginReconfigure, request); err != nil {
+		t.Fatalf("配置全局加权调度测试应用失败: %v", err)
+	}
+	if !app.store.GlobalWeightedRoundRobin() {
+		t.Fatal("期望全局加权轮询开关已启用")
+	}
+	return app, plain
 }
 
 func TestSchedulerPickFiltersByPlanType(t *testing.T) {
@@ -99,6 +218,171 @@ func TestSchedulerPickPriorityTiebreaksByID(t *testing.T) {
 	}
 	if resp2.AuthID != "codex-a-team" {
 		t.Fatalf("expected lowest ID tiebreak, got %q", resp2.AuthID)
+	}
+}
+
+func TestSchedulerPickSmoothWeightedRoundRobin(t *testing.T) {
+	app, _ := configureTestApp(t)
+	request := SchedulerPickRequest{
+		Provider: "codex",
+		Model:    "gpt-5-codex",
+		Options:  SchedulerPickOptions{Metadata: map[string]any{"group": "team"}},
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "codex-heavy", Provider: "codex", Weight: 5, Attributes: map[string]string{"plan_type": "team"}},
+			{ID: "codex-light", Provider: "codex", Weight: 1, Attributes: map[string]string{"plan_type": "team"}},
+		},
+	}
+
+	counts := map[string]int{}
+	for index := 0; index < 12; index++ {
+		resp := schedulerPickForTest(t, app, request)
+		counts[resp.AuthID]++
+	}
+	if counts["codex-heavy"] != 10 || counts["codex-light"] != 2 {
+		t.Fatalf("期望 12 次请求按 5:1 分配，实际为 %v", counts)
+	}
+}
+
+func TestSchedulerPickReadsWeightFromAttributesAndMetadata(t *testing.T) {
+	app, _ := configureTestApp(t)
+	request := SchedulerPickRequest{
+		Provider: "codex",
+		Model:    "gpt-5-codex",
+		Options:  SchedulerPickOptions{Metadata: map[string]any{"group": "team"}},
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "from-attributes", Provider: "codex", Attributes: map[string]string{"plan_type": "team", "weight": "3"}},
+			{ID: "from-metadata", Provider: "codex", Attributes: map[string]string{"plan_type": "team"}, Metadata: map[string]any{"Weight": float64(1)}},
+		},
+	}
+
+	counts := map[string]int{}
+	for index := 0; index < 8; index++ {
+		resp := schedulerPickForTest(t, app, request)
+		counts[resp.AuthID]++
+	}
+	if counts["from-attributes"] != 6 || counts["from-metadata"] != 2 {
+		t.Fatalf("期望从候选字段读取 3:1 权重，实际为 %v", counts)
+	}
+}
+
+func TestSchedulerPickWeightZeroIsExcluded(t *testing.T) {
+	app, _ := configureTestApp(t)
+	request := SchedulerPickRequest{
+		Provider: "codex",
+		Options:  SchedulerPickOptions{Metadata: map[string]any{"group": "team"}},
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "paused", Provider: "codex", Priority: 20, Weight: 0, Attributes: map[string]string{"plan_type": "team"}},
+			{ID: "active", Provider: "codex", Priority: 10, Weight: 1, Attributes: map[string]string{"plan_type": "team"}},
+		},
+	}
+
+	resp := schedulerPickForTest(t, app, request)
+	if resp.AuthID != "active" {
+		t.Fatalf("零权重凭证不应阻塞低优先级的可用凭证，实际选择 %q", resp.AuthID)
+	}
+}
+
+func TestSchedulerPickUsesOnlyHighestPositivePriority(t *testing.T) {
+	app, _ := configureTestApp(t)
+	request := SchedulerPickRequest{
+		Provider: "codex",
+		Model:    "gpt-5-codex",
+		Options:  SchedulerPickOptions{Metadata: map[string]any{"group": "team"}},
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "primary-a", Provider: "codex", Priority: 10, Weight: 2, Attributes: map[string]string{"plan_type": "team"}},
+			{ID: "primary-b", Provider: "codex", Priority: 10, Weight: 1, Attributes: map[string]string{"plan_type": "team"}},
+			{ID: "fallback", Provider: "codex", Priority: 1, Weight: 100, Attributes: map[string]string{"plan_type": "team"}},
+		},
+	}
+
+	counts := map[string]int{}
+	for index := 0; index < 9; index++ {
+		resp := schedulerPickForTest(t, app, request)
+		counts[resp.AuthID]++
+	}
+	if counts["primary-a"] != 6 || counts["primary-b"] != 3 || counts["fallback"] != 0 {
+		t.Fatalf("期望只在最高优先级层按 2:1 分配，实际为 %v", counts)
+	}
+}
+
+func TestSchedulerPickWeightedStateIsConcurrent(t *testing.T) {
+	app, _ := configureTestApp(t)
+	request := SchedulerPickRequest{
+		Provider: "codex",
+		Model:    "gpt-5-codex",
+		Options:  SchedulerPickOptions{Metadata: map[string]any{"group": "team"}},
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "a", Provider: "codex", Weight: 2, Attributes: map[string]string{"plan_type": "team"}},
+			{ID: "b", Provider: "codex", Weight: 1, Attributes: map[string]string{"plan_type": "team"}},
+		},
+	}
+
+	const total = 300
+	rawRequest, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts := map[string]int{}
+	var countsMu sync.Mutex
+	var workers sync.WaitGroup
+	errors := make(chan error, total)
+	for index := 0; index < total; index++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			rawResponse, callErr := app.HandleMethod(MethodSchedulerPick, rawRequest)
+			if callErr != nil {
+				errors <- callErr
+				return
+			}
+			var resp SchedulerPickResponse
+			if callErr = unmarshalOK(rawResponse, &resp); callErr != nil {
+				errors <- callErr
+				return
+			}
+			if !resp.Handled || resp.AuthID == "" {
+				errors <- fmt.Errorf("unexpected scheduler response: %+v", resp)
+				return
+			}
+			countsMu.Lock()
+			counts[resp.AuthID]++
+			countsMu.Unlock()
+		}()
+	}
+	workers.Wait()
+	close(errors)
+	for callErr := range errors {
+		t.Fatal(callErr)
+	}
+	if counts["a"] != 200 || counts["b"] != 100 {
+		t.Fatalf("期望并发请求全局按 2:1 分配，实际为 %v", counts)
+	}
+}
+
+func TestSchedulerPickAllWeightsPausedReturnsError(t *testing.T) {
+	app, _ := configureTestApp(t)
+	request := SchedulerPickRequest{
+		Provider: "codex",
+		Options:  SchedulerPickOptions{Metadata: map[string]any{"group": "team"}},
+		Candidates: []SchedulerAuthCandidate{
+			{ID: "paused-a", Provider: "codex", Weight: 0, Attributes: map[string]string{"plan_type": "team"}},
+			{ID: "paused-b", Provider: "codex", Weight: -1, Attributes: map[string]string{"plan_type": "team"}},
+		},
+	}
+	rawRequest, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawResponse, err := app.HandleMethod(MethodSchedulerPick, rawRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope Envelope
+	if err := json.Unmarshal(rawResponse, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.OK || envelope.Error == nil || envelope.Error.Code != "auth_not_found" {
+		t.Fatalf("所有凭证暂停时应返回 auth_not_found，实际为 %+v", envelope)
 	}
 }
 
@@ -251,4 +535,24 @@ func unmarshalOK(raw []byte, v any) error {
 		return err
 	}
 	return json.Unmarshal(env.Result, v)
+}
+
+func schedulerPickForTest(t *testing.T, app *App, request SchedulerPickRequest) SchedulerPickResponse {
+	t.Helper()
+	rawRequest, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawResponse, err := app.HandleMethod(MethodSchedulerPick, rawRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response SchedulerPickResponse
+	if err := unmarshalOK(rawResponse, &response); err != nil {
+		t.Fatal(err)
+	}
+	if !response.Handled || response.AuthID == "" {
+		t.Fatalf("期望调度器接管请求并返回凭证，实际为 %+v", response)
+	}
+	return response
 }

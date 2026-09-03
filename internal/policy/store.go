@@ -12,15 +12,16 @@ import (
 )
 
 type Store struct {
-	mu         sync.RWMutex
-	updateMu   sync.Mutex
-	persistMu  sync.Mutex
-	enabled    bool
-	statePath  string
-	keys       map[string]*KeyConfig
-	keysByHash map[string]*KeyConfig
-	limiter    *RateLimiter
-	usage      *usageLedger
+	mu                       sync.RWMutex
+	updateMu                 sync.Mutex
+	persistMu                sync.Mutex
+	enabled                  bool
+	globalWeightedRoundRobin bool
+	statePath                string
+	keys                     map[string]*KeyConfig
+	keysByHash               map[string]*KeyConfig
+	limiter                  *RateLimiter
+	usage                    *usageLedger
 	// flusher for periodically persisting the usage ledger to the state file.
 	flusher *usageFlusher
 	// aliases is the global alias mapping table from config.yaml. Used to
@@ -122,6 +123,9 @@ func (s *Store) Configure(cfg Config) error {
 	if state, errLoad := LoadState(statePath); errLoad == nil {
 		keys = state.Keys
 		loadedUsage = state.Usage
+		if state.GlobalWeightedRoundRobin != nil {
+			cfg.GlobalWeightedRoundRobin = *state.GlobalWeightedRoundRobin
+		}
 		// If config.yaml has no global alias table, fall back to the one
 		// persisted in state (so state-only reloads resolve key alias refs).
 		stateAliases := cfg.Aliases
@@ -186,6 +190,7 @@ func (s *Store) Configure(cfg Config) error {
 	// serializes this replacement with management mutations, so a revoked or
 	// deleted key cannot be resurrected from an older in-memory snapshot.
 	s.enabled = cfg.Enabled
+	s.globalWeightedRoundRobin = cfg.GlobalWeightedRoundRobin
 	s.statePath = statePath
 	// Store the global alias table and classify rules for routing/billing.
 	s.aliases = make(map[string]*AliasMapping, len(cfg.Aliases))
@@ -235,6 +240,41 @@ func (s *Store) Enabled() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.enabled
+}
+
+// GlobalWeightedRoundRobin 报告插件是否应忽略路由组，直接进入全局权重池。
+func (s *Store) GlobalWeightedRoundRobin() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.globalWeightedRoundRobin
+}
+
+// SetGlobalWeightedRoundRobin 更新并持久化全局加权轮询开关。
+func (s *Store) SetGlobalWeightedRoundRobin(enabled bool) error {
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+
+	s.mu.Lock()
+	previous := s.globalWeightedRoundRobin
+	if previous == enabled {
+		s.mu.Unlock()
+		return nil
+	}
+	s.globalWeightedRoundRobin = enabled
+	keys := s.keysSnapshotLocked()
+	usage := s.usageSnapshotLocked()
+	aliases := s.aliasesSnapshotLocked()
+	rules := s.classifyRulesSnapshotLocked()
+	path := s.statePath
+	s.mu.Unlock()
+
+	if err := s.saveState(path, keys, usage, aliases, rules); err != nil {
+		s.mu.Lock()
+		s.globalWeightedRoundRobin = previous
+		s.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 func (s *Store) runtimeComponents() (*RateLimiter, *usageLedger) {
@@ -696,6 +736,12 @@ func (s *Store) AliasUsageFor(keyID string) (KeyConfig, []AliasUsageEntry, bool)
 // FindByAPIKey resolves a downstream plain key to policy (copy). Returns nil when unknown.
 func (s *Store) FindByAPIKey(raw string) *KeyConfig {
 	return s.findBySecret(raw)
+}
+
+// OwnsRequestKey 报告请求是否使用了当前已启用的插件密钥。
+func (s *Store) OwnsRequestKey(headers http.Header) bool {
+	key, enabled := s.findBySecretWhenEnabled(ExtractAPIKey(headers, nil))
+	return enabled && key != nil && key.Enabled
 }
 
 func (s *Store) findBySecret(raw string) *KeyConfig {
@@ -1310,7 +1356,10 @@ func (s *Store) FlushUsage() error {
 func (s *Store) saveState(path string, keys []KeyConfig, usage map[string]*UsageState, aliases []AliasMapping, rules []ClassifyRule) error {
 	s.persistMu.Lock()
 	defer s.persistMu.Unlock()
-	return SaveState(path, keys, usage, aliases, rules)
+	s.mu.RLock()
+	globalWeightedRoundRobin := s.globalWeightedRoundRobin
+	s.mu.RUnlock()
+	return saveStateWithSettings(path, keys, usage, aliases, rules, globalWeightedRoundRobin)
 }
 
 func (s *Store) saveUsageOnly(path string, usage map[string]*UsageState) error {
@@ -1377,6 +1426,7 @@ func (f *usageFlusher) loop() {
 func (s *Store) Status() map[string]any {
 	s.mu.RLock()
 	enabled := s.enabled
+	globalWeightedRoundRobin := s.globalWeightedRoundRobin
 	statePath := s.statePath
 	keys := s.keysSnapshotLocked()
 	limiter := s.limiter
@@ -1387,11 +1437,12 @@ func (s *Store) Status() map[string]any {
 		rpmUsage = limiter.Snapshot()
 	}
 	out := map[string]any{
-		"enabled":    enabled,
-		"state_file": statePath,
-		"key_count":  len(keys),
-		"rpm_usage":  rpmUsage,
-		"usage":      usageSummaryForKeys(usage, keys),
+		"enabled":                     enabled,
+		"global_weighted_round_robin": globalWeightedRoundRobin,
+		"state_file":                  statePath,
+		"key_count":                   len(keys),
+		"rpm_usage":                   rpmUsage,
+		"usage":                       usageSummaryForKeys(usage, keys),
 	}
 	return out
 }

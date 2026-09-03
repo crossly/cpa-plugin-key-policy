@@ -43,7 +43,7 @@ const (
 const (
 	PluginID   = "cpa-key-policy"
 	PluginName = "cpa-key-policy"
-	Version    = "0.4.4"
+	Version    = "0.5.0"
 )
 
 type Envelope struct {
@@ -132,10 +132,9 @@ type ModelRouteResponse struct {
 	Reason      string `json:"Reason,omitempty"`
 }
 
-// SchedulerPickRequest is the payload of the host->plugin scheduler.pick call.
-// It mirrors pluginapi.SchedulerPickRequest. The plugin only needs Provider,
-// Model, Options.Metadata (carrying the group we stamped at authenticate time)
-// and Candidates[].Attributes (codex plan_type etc.).
+// SchedulerPickRequest 是宿主调用 scheduler.pick 时的载荷。
+// 其结构与 pluginapi.SchedulerPickRequest 保持一致：Options 携带请求头与
+// 可选的 group 元数据，Candidates 携带凭证档位与权重属性。
 type SchedulerPickRequest struct {
 	Provider   string                   `json:"Provider,omitempty"`
 	Providers  []string                 `json:"Providers,omitempty"`
@@ -155,6 +154,7 @@ type SchedulerAuthCandidate struct {
 	ID         string            `json:"ID"`
 	Provider   string            `json:"Provider"`
 	Priority   int               `json:"Priority,omitempty"`
+	Weight     any               `json:"Weight,omitempty"`
 	Status     string            `json:"Status,omitempty"`
 	Attributes map[string]string `json:"Attributes,omitempty"`
 	Metadata   map[string]any    `json:"Metadata,omitempty"`

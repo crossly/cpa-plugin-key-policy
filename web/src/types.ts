@@ -137,9 +137,14 @@ export interface CatalogModel {
 
 export interface StatusResponse {
   enabled: boolean;
+  global_weighted_round_robin?: boolean;
   state_file: string;
   key_count: number;
   rpm_usage?: Record<string, unknown>;
+}
+
+export interface SchedulerSettings {
+  global_weighted_round_robin: boolean;
 }
 
 // --- Advanced Mapping types ---

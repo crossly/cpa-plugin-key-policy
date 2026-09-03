@@ -15,9 +15,10 @@ import (
 )
 
 type Config struct {
-	Enabled   bool        `yaml:"enabled" json:"enabled"`
-	StateFile string      `yaml:"state_file" json:"state_file"`
-	Keys      []KeyConfig `yaml:"keys" json:"keys"`
+	Enabled                  bool        `yaml:"enabled" json:"enabled"`
+	StateFile                string      `yaml:"state_file" json:"state_file"`
+	GlobalWeightedRoundRobin bool        `yaml:"global_weighted_round_robin,omitempty" json:"global_weighted_round_robin,omitempty"`
+	Keys                     []KeyConfig `yaml:"keys" json:"keys"`
 	// Aliases is the global alias mapping table. Each entry maps a downstream
 	// alias name to one or more (provider, model, group) targets with a shared
 	// pricing config. Keys reference aliases by name via KeyAliasRef.
@@ -269,10 +270,11 @@ type UsageWindow struct {
 }
 
 type State struct {
-	Version   int                    `json:"version"`
-	Keys      []KeyConfig            `json:"keys"`
-	Usage     map[string]*UsageState `json:"usage,omitempty"`
-	UpdatedAt time.Time              `json:"updated_at"`
+	Version                  int                    `json:"version"`
+	Keys                     []KeyConfig            `json:"keys"`
+	Usage                    map[string]*UsageState `json:"usage,omitempty"`
+	UpdatedAt                time.Time              `json:"updated_at"`
+	GlobalWeightedRoundRobin *bool                  `json:"global_weighted_round_robin,omitempty"`
 	// Aliases is the global alias mapping table, persisted so that key alias
 	// references survive restarts even when config.yaml is not re-read. On
 	// Configure, the config.yaml Aliases take precedence; state Aliases are a
@@ -660,6 +662,15 @@ func LoadState(path string) (*State, error) {
 
 // SaveState atomically writes the key list plus usage ledger to the state file.
 func SaveState(path string, keys []KeyConfig, usage map[string]*UsageState, aliases []AliasMapping, rules []ClassifyRule) error {
+	return saveStateDocument(path, keys, usage, aliases, rules, nil)
+}
+
+func saveStateWithSettings(path string, keys []KeyConfig, usage map[string]*UsageState, aliases []AliasMapping, rules []ClassifyRule, globalWeightedRoundRobin bool) error {
+	value := globalWeightedRoundRobin
+	return saveStateDocument(path, keys, usage, aliases, rules, &value)
+}
+
+func saveStateDocument(path string, keys []KeyConfig, usage map[string]*UsageState, aliases []AliasMapping, rules []ClassifyRule, globalWeightedRoundRobin *bool) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -675,7 +686,15 @@ func SaveState(path string, keys []KeyConfig, usage map[string]*UsageState, alia
 		cleanKeys[i] = keys[i]
 		cleanKeys[i].Models = nil
 	}
-	state := State{Version: 1, Keys: cleanKeys, Usage: usage, UpdatedAt: time.Now().UTC(), Aliases: aliases, ClassifyRules: rules}
+	state := State{
+		Version:                  1,
+		Keys:                     cleanKeys,
+		Usage:                    usage,
+		UpdatedAt:                time.Now().UTC(),
+		GlobalWeightedRoundRobin: globalWeightedRoundRobin,
+		Aliases:                  aliases,
+		ClassifyRules:            rules,
+	}
 	raw, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
@@ -699,10 +718,12 @@ func SaveUsageOnly(path string, usage map[string]*UsageState) error {
 	var keys []KeyConfig
 	var aliases []AliasMapping
 	var rules []ClassifyRule
+	var globalWeightedRoundRobin *bool
 	if cur, err := LoadState(path); err == nil {
 		keys = cur.Keys
 		aliases = cur.Aliases
 		rules = cur.ClassifyRules
+		globalWeightedRoundRobin = cur.GlobalWeightedRoundRobin
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -712,7 +733,15 @@ func SaveUsageOnly(path string, usage map[string]*UsageState) error {
 	for i := range keys {
 		keys[i].Models = nil
 	}
-	state := State{Version: 1, Keys: keys, Usage: usage, UpdatedAt: time.Now().UTC(), Aliases: aliases, ClassifyRules: rules}
+	state := State{
+		Version:                  1,
+		Keys:                     keys,
+		Usage:                    usage,
+		UpdatedAt:                time.Now().UTC(),
+		GlobalWeightedRoundRobin: globalWeightedRoundRobin,
+		Aliases:                  aliases,
+		ClassifyRules:            rules,
+	}
 	raw, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err

@@ -1,5 +1,11 @@
 import { apiClient, pluginPath } from "./client";
-import type { AliasMapping, ClassifyRule, CredentialDescriptor, ClassifyPreviewResponse } from "../types";
+import type {
+  AliasMapping,
+  ClassifyRule,
+  CredentialDescriptor,
+  ClassifyPreviewResponse,
+  SchedulerSettings,
+} from "../types";
 import { readPlanType } from "./models";
 
 // --- Alias mapping CRUD ---
@@ -19,6 +25,20 @@ export async function upsertAlias(alias: AliasMapping): Promise<AliasMapping> {
 export async function deleteAlias(aliasName: string): Promise<void> {
   const c = apiClient();
   await c.delete(pluginPath("/aliases"), { data: { alias: aliasName } });
+}
+
+export async function fetchSchedulerSettings(): Promise<SchedulerSettings> {
+  const c = apiClient();
+  const { data } = await c.get<SchedulerSettings>(pluginPath("/settings"));
+  return data;
+}
+
+export async function updateSchedulerSettings(globalWeightedRoundRobin: boolean): Promise<SchedulerSettings> {
+  const c = apiClient();
+  const { data } = await c.patch<SchedulerSettings>(pluginPath("/settings"), {
+    global_weighted_round_robin: globalWeightedRoundRobin,
+  });
+  return data;
 }
 
 // --- Classification rule CRUD ---

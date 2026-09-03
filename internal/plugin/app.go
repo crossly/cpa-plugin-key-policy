@@ -17,6 +17,8 @@ type App struct {
 	store         *policy.Store
 	classifyMu    sync.RWMutex
 	classifyCache map[string][]string
+	schedulerMu   sync.Mutex
+	schedulerRR   map[string]*smoothWeightedState
 }
 
 const classifyCacheCapacity = 4096
@@ -24,7 +26,11 @@ const classifyCacheCapacity = 4096
 func NewApp() *App {
 	store := policy.NewStore()
 	_ = store.Configure(policy.DefaultConfig())
-	return &App{store: store, classifyCache: make(map[string][]string)}
+	return &App{
+		store:         store,
+		classifyCache: make(map[string][]string),
+		schedulerRR:   make(map[string]*smoothWeightedState),
+	}
 }
 
 func (a *App) HandleMethod(method string, request []byte) ([]byte, error) {
@@ -88,8 +94,10 @@ func (a *App) configure(raw []byte) error {
 	// Register the classify cache clear callback, then clear once for safety.
 	a.store.SetOnClassifyRulesChanged(func() {
 		a.clearClassifyCache()
+		a.clearSchedulerState()
 	})
 	a.clearClassifyCache()
+	a.clearSchedulerState()
 	a.store.StartUsageFlusher()
 	return nil
 }
@@ -110,6 +118,7 @@ func (a *App) registration() Registration {
 			ConfigFields: []ConfigField{
 				{Name: "enabled", Type: "boolean", Description: "Enable or disable this plugin without unloading it."},
 				{Name: "state_file", Type: "string", Description: "JSON state file used for key policy changes made through the Management API."},
+				{Name: "global_weighted_round_robin", Type: "boolean", Description: "忽略别名目标的 group，对当前 provider/model 的全部候选凭证执行全局加权轮询。"},
 				{Name: "keys", Type: "array", Description: "Initial downstream key policy list. State file wins after it exists."},
 			},
 		},
@@ -235,38 +244,40 @@ func (a *App) interceptResponse(raw []byte) ([]byte, error) {
 	return OKEnvelope(ResponseInterceptResponse{Body: body})
 }
 
-// pickScheduler implements the scheduler.pick host->plugin call. When the
-// routed ModelRule had a Group (codex plan_type / antigravity tier), restrict
-// candidate auths to those whose Attributes carry a matching identity. Any
-// Group "" or a group we can't recognize → defer to the host scheduler
-// (Handled=false), preserving legacy "any auth for the provider" behavior.
+// pickScheduler 处理 scheduler.pick 调用。当路由规则指定 Group 时，
+// 只保留 Attributes 匹配该组的凭证；Group 为空时，在 CPA 提供的
+// 全部候选凭证中调度。这使未将前端鉴权元数据转发到调度器
+// 的宿主版本也能对插件密钥执行全局加权轮询。
 //
-// The plugin never sees the downstream ModelRule directly here; the group was
-// stamped into request metadata by authenticate(), and the host forwards it as
-// Options.Metadata["group"]. We read it defensively as either string or any.
+// 调度器不会直接收到下游 ModelRule。新版宿主会将 authenticate 写入的
+// group 转发到 Options.Metadata["group"]，旧版宿主则通过请求头判断
+// 是否为插件自有密钥，并进入无组全局池。
 //
-// Candidate filtering, in order:
-//  1. Keep candidates whose Attributes["plan_type"] (codex) equals the group.
-//     Also accept Attributes["tier"] (antigravity) to match the same group.
-//  2. A group of "supported" means "codex without an id_token plan" — match
-//     candidates whose plan_type we cannot read (treat unknown plan as that
-//     bucket), so a supported-but-untiered auth file serves them rather than
-//     any tiered one.
+// 候选过滤规则：
+//  1. Codex 的 Attributes["plan_type"] 或 Antigravity 的 Attributes["tier"]
+//     必须与 group 相同。
+//  2. "supported" 组匹配无法读取 plan_type 的 Codex 凭证，使未分档凭证
+//     不会被混入其他档位。
 //
-// Among filtered candidates, pick the host's highest-priority one (ties broken
-// by lowest ID for determinism). We do not have access to the model-capability
-// registry here (it's a separate pluginapi capability), so the host still owns
-// the final "is this auth able to serve this model" check via delegate; if a
-// chosen candidate can't serve the model the host falls back. This is the same
-// trust boundary the built-in scheduler operates under.
+// 过滤后只保留最高优先级的一层，再按凭证权重执行平滑加权轮询。权重默认
+// 为 1，非正数表示不再接收新请求，过大的权重会被限制。状态按
+// provider/model/group/priority 全局共享，因此所有下游 cpa_* 密钥共用
+// 同一个分配序列，而不是各自重新开始轮询。
 func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 	var req SchedulerPickRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
 	group := schedulerGroupFromMetadata(req.Options.Metadata)
-	if group == "" {
-		// No tier narrowed by this downstream key → let the host pick freely.
+	globalMode := a.store.GlobalWeightedRoundRobin()
+	if globalMode {
+		if !a.store.OwnsRequestKey(http.Header(req.Options.Headers)) {
+			// 全局模式仅接管插件自有密钥，原生密钥仍由 CPA 调度。
+			return OKEnvelope(SchedulerPickResponse{Handled: false})
+		}
+		group = ""
+	} else if group == "" && !a.store.OwnsRequestKey(http.Header(req.Options.Headers)) {
+		// 无组兼容路径只能影响插件自己的密钥，原生密钥仍由 CPA 调度。
 		return OKEnvelope(SchedulerPickResponse{Handled: false})
 	}
 	if len(req.Candidates) == 0 {
@@ -278,27 +289,40 @@ func (a *App) pickScheduler(raw []byte) ([]byte, error) {
 		if !schedulerCandidateUsable(cand.Status) {
 			continue
 		}
-		if a.candidateMatchesGroup(cand, group) {
+		if group == "" || a.candidateMatchesGroup(cand, group) {
 			matched = append(matched, cand)
 		}
 	}
 	if len(matched) == 0 {
-		// No candidate of this tier is available: do not silently degrade to a
-		// different tier (that would break the isolation guarantee). Returning
-		// Handled=false would let the host pick ANY auth including other tiers.
-		// Instead we report an explicit "auth_not_found" so the caller sees the
-		// intent honored (no available tier-matching auth) rather than a leak.
-		return ErrorEnvelope("auth_not_found", "cpa-key-policy: no eligible auth candidate for requested group", http.StatusServiceUnavailable), nil
+		if group != "" {
+			// 不降级到其他组，否则宿主可能选中不属于目标组的凭证。
+			return ErrorEnvelope("auth_not_found", "cpa-key-policy: 请求的凭证组没有可用候选项", http.StatusServiceUnavailable), nil
+		}
+		return ErrorEnvelope("auth_not_found", "cpa-key-policy: 没有可用的凭证候选项", http.StatusServiceUnavailable), nil
 	}
 
-	best := matched[0]
-	for _, cand := range matched[1:] {
-		if cand.Priority > best.Priority ||
-			(cand.Priority == best.Priority && cand.ID < best.ID) {
-			best = cand
+	maxPriority := 0
+	prioritySet := false
+	weighted := make([]SchedulerAuthCandidate, 0, len(matched))
+	for _, cand := range matched {
+		if schedulerCandidateWeight(cand) <= 0 {
+			continue
+		}
+		if !prioritySet || cand.Priority > maxPriority {
+			maxPriority = cand.Priority
+			prioritySet = true
+			weighted = weighted[:0]
+		}
+		if cand.Priority == maxPriority {
+			weighted = append(weighted, cand)
 		}
 	}
-	return OKEnvelope(SchedulerPickResponse{Handled: true, AuthID: best.ID})
+	if len(weighted) == 0 {
+		return ErrorEnvelope("auth_not_found", "cpa-key-policy: 匹配的凭证均没有正权重", http.StatusServiceUnavailable), nil
+	}
+
+	picked := a.pickSmoothWeighted(req, group, maxPriority, weighted)
+	return OKEnvelope(SchedulerPickResponse{Handled: true, AuthID: picked.ID})
 }
 
 func schedulerCandidateUsable(status string) bool {
@@ -487,6 +511,8 @@ func (a *App) managementRegistration() ManagementRegistrationResponse {
 			{Method: http.MethodPost, Path: base + "/keys/reset-rpm", Description: "Reset one downstream CPA key RPM counter by id."},
 			{Method: http.MethodGet, Path: base + "/keys/usage", Description: "Per-alias usage breakdown for one downstream CPA key by id."},
 			{Method: http.MethodGet, Path: base + "/status", Description: "Show cpa-key-policy runtime status."},
+			{Method: http.MethodGet, Path: base + "/settings", Description: "Show scheduler settings."},
+			{Method: http.MethodPatch, Path: base + "/settings", Description: "Update scheduler settings."},
 			{Method: http.MethodGet, Path: base + "/aliases", Description: "List the global alias mapping table."},
 			{Method: http.MethodPost, Path: base + "/aliases", Description: "Create or update a global alias mapping."},
 			{Method: http.MethodDelete, Path: base + "/aliases", Description: "Delete a global alias mapping by name."},
@@ -536,6 +562,10 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 		return OKEnvelope(a.keyUsage(idFromRequest(req.Query, req.Body)))
 	case req.Method == http.MethodGet && path == base+"/status":
 		return OKEnvelope(jsonResponse(http.StatusOK, a.store.Status()))
+	case req.Method == http.MethodGet && path == base+"/settings":
+		return OKEnvelope(a.schedulerSettings())
+	case req.Method == http.MethodPatch && path == base+"/settings":
+		return OKEnvelope(a.updateSchedulerSettings(req.Body))
 	case req.Method == http.MethodGet && path == base+"/aliases":
 		return OKEnvelope(jsonResponse(http.StatusOK, map[string]any{"aliases": a.store.AliasesSnapshot()}))
 	case req.Method == http.MethodPost && path == base+"/aliases":
@@ -557,6 +587,31 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 	default:
 		return OKEnvelope(jsonError(http.StatusNotFound, "not_found", "unknown management route"))
 	}
+}
+
+type schedulerSettingsRequest struct {
+	GlobalWeightedRoundRobin *bool `json:"global_weighted_round_robin"`
+}
+
+func (a *App) schedulerSettings() ManagementResponse {
+	return jsonResponse(http.StatusOK, map[string]any{
+		"global_weighted_round_robin": a.store.GlobalWeightedRoundRobin(),
+	})
+}
+
+func (a *App) updateSchedulerSettings(body []byte) ManagementResponse {
+	var request schedulerSettingsRequest
+	if err := json.Unmarshal(body, &request); err != nil {
+		return jsonError(http.StatusBadRequest, "invalid_json", err.Error())
+	}
+	if request.GlobalWeightedRoundRobin == nil {
+		return jsonError(http.StatusBadRequest, "missing_setting", "缺少 global_weighted_round_robin 设置")
+	}
+	if err := a.store.SetGlobalWeightedRoundRobin(*request.GlobalWeightedRoundRobin); err != nil {
+		return jsonError(http.StatusInternalServerError, "settings_persist_failed", "保存调度设置失败: "+err.Error())
+	}
+	a.clearSchedulerState()
+	return a.schedulerSettings()
 }
 
 type keyWriteRequest struct {
