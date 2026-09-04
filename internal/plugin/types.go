@@ -50,7 +50,7 @@ const (
 const (
 	PluginID   = "cpa-key-policy"
 	PluginName = "cpa-key-policy"
-	Version    = "0.4.7"
+	Version    = "0.5.1"
 )
 
 type Envelope struct {
@@ -193,6 +193,7 @@ type SchedulerAuthCandidate struct {
 	ID         string            `json:"ID"`
 	Provider   string            `json:"Provider"`
 	Priority   int               `json:"Priority,omitempty"`
+	Weight     any               `json:"Weight,omitempty"`
 	Status     string            `json:"Status,omitempty"`
 	Attributes map[string]string `json:"Attributes,omitempty"`
 	Metadata   map[string]any    `json:"Metadata,omitempty"`

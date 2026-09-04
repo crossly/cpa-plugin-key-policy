@@ -13,16 +13,17 @@ import (
 )
 
 type Store struct {
-	mu             sync.RWMutex
-	updateMu       sync.Mutex
-	persistMu      sync.Mutex
-	usagePersistMu sync.Mutex
-	enabled        bool
-	statePath      string
-	keys           map[string]*KeyConfig
-	keysByHash     map[string]*KeyConfig
-	limiter        *RateLimiter
-	usage          *usageLedger
+	mu                       sync.RWMutex
+	updateMu                 sync.Mutex
+	persistMu                sync.Mutex
+	usagePersistMu           sync.Mutex
+	enabled                  bool
+	globalWeightedRoundRobin bool
+	statePath                string
+	keys                     map[string]*KeyConfig
+	keysByHash               map[string]*KeyConfig
+	limiter                  *RateLimiter
+	usage                    *usageLedger
 	// flusher for periodically persisting the usage ledger to the state file.
 	flusher *usageFlusher
 	// aliases is the global alias mapping table from config.yaml. Used to
@@ -124,6 +125,9 @@ func (s *Store) Configure(cfg Config) error {
 	if state, errLoad := LoadState(statePath); errLoad == nil {
 		keys = state.Keys
 		loadedUsage = state.Usage
+		if state.GlobalWeightedRoundRobin != nil {
+			cfg.GlobalWeightedRoundRobin = *state.GlobalWeightedRoundRobin
+		}
 		// If config.yaml has no global alias table, fall back to the one
 		// persisted in state (so state-only reloads resolve key alias refs).
 		stateAliases := cfg.Aliases
@@ -188,6 +192,7 @@ func (s *Store) Configure(cfg Config) error {
 	// serializes this replacement with management mutations, so a revoked or
 	// deleted key cannot be resurrected from an older in-memory snapshot.
 	s.enabled = cfg.Enabled
+	s.globalWeightedRoundRobin = cfg.GlobalWeightedRoundRobin
 	s.statePath = statePath
 	// Store the global alias table and classify rules for routing/billing.
 	s.aliases = make(map[string]*AliasMapping, len(cfg.Aliases))
@@ -237,6 +242,41 @@ func (s *Store) Enabled() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.enabled
+}
+
+// GlobalWeightedRoundRobin 报告插件是否应忽略路由组，直接进入全局权重池。
+func (s *Store) GlobalWeightedRoundRobin() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.globalWeightedRoundRobin
+}
+
+// SetGlobalWeightedRoundRobin 更新并持久化全局加权轮询开关。
+func (s *Store) SetGlobalWeightedRoundRobin(enabled bool) error {
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+
+	s.mu.Lock()
+	previous := s.globalWeightedRoundRobin
+	if previous == enabled {
+		s.mu.Unlock()
+		return nil
+	}
+	s.globalWeightedRoundRobin = enabled
+	keys := s.keysSnapshotLocked()
+	usage := s.usageSnapshotLocked()
+	aliases := s.aliasesSnapshotLocked()
+	rules := s.classifyRulesSnapshotLocked()
+	path := s.statePath
+	s.mu.Unlock()
+
+	if err := s.saveState(path, keys, usage, aliases, rules); err != nil {
+		s.mu.Lock()
+		s.globalWeightedRoundRobin = previous
+		s.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 func (s *Store) runtimeComponents() (*RateLimiter, *usageLedger) {
@@ -793,6 +833,12 @@ func (s *Store) FindByAPIKey(raw string) *KeyConfig {
 	return s.findBySecret(raw)
 }
 
+// OwnsRequestKey 报告请求是否使用了当前已启用的插件密钥。
+func (s *Store) OwnsRequestKey(headers http.Header) bool {
+	key, enabled := s.findBySecretWhenEnabled(ExtractAPIKey(headers, nil))
+	return enabled && key != nil && key.Enabled
+}
+
 func (s *Store) findBySecret(raw string) *KeyConfig {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -957,67 +1003,45 @@ func resolveAliasRefsToModels(refs []KeyAliasRef, aliases map[string]*AliasMappi
 
 // ApplyModelPricesToAliasRefs merges per-key price overrides from a submitted
 // Models list into the key's Alias refs. The management UI submits pricing as
-// ModelRule rows (keyed frontend-side by (group|alias); see priceKey in
-// KeyForm.tsx), while the canonical per-key override lives on KeyAliasRef
-// (per alias name, *float64 with nil = use global alias pricing). Without this
-// merge, a PATCH that carries Models but not Aliases silently drops the
-// prices: migrateModelsToAliases keeps the existing refs (which carry no
-// overrides) and UpsertKey re-derives Models from them, so billing falls back
-// to global prices.
-//
-// Matching is by alias name, case-insensitive; when a multi-target alias
-// expands to several submitted rows the first row wins (the override is
-// alias-level and cannot represent per-group prices anyway). For each matched
-// ref:
-//   - if any of the four price fields is non-zero, or the row bills per_call,
-//     all four fields are copied into the ref's override pointers (the UI
-//     always submits complete rows, pre-filled with the resolved prices, so
-//     untouched fields round-trip their current value);
-//   - otherwise (all prices zero under token billing) the overrides are
-//     cleared to nil, falling back to global alias pricing.
-//
-// Refs without a matching row are left untouched. Callers must only invoke
-// this when Models was actually submitted by the client — passing the
-// store-derived Models (global prices baked in) would pin global prices as
-// permanent per-key overrides.
+// ModelRule rows, while the canonical per-key override lives on KeyAliasRef.
+// Callers must only invoke this when Models was actually submitted by the
+// client; passing store-derived Models would pin global prices permanently.
 func ApplyModelPricesToAliasRefs(key *KeyConfig) {
 	if key == nil || len(key.Aliases) == 0 || len(key.Models) == 0 {
 		return
 	}
 	priceByAlias := make(map[string]ModelRule, len(key.Models))
-	for _, m := range key.Models {
-		lk := strings.ToLower(strings.TrimSpace(m.Alias))
-		if lk == "" {
+	for _, model := range key.Models {
+		alias := strings.ToLower(strings.TrimSpace(model.Alias))
+		if alias == "" {
 			continue
 		}
-		if _, ok := priceByAlias[lk]; !ok {
-			priceByAlias[lk] = m
+		if _, exists := priceByAlias[alias]; !exists {
+			priceByAlias[alias] = model
 		}
 	}
 	for i := range key.Aliases {
 		ref := &key.Aliases[i]
-		row, ok := priceByAlias[strings.ToLower(strings.TrimSpace(ref.Alias))]
+		model, ok := priceByAlias[strings.ToLower(strings.TrimSpace(ref.Alias))]
 		if !ok {
 			continue
 		}
-		isPerCall := strings.EqualFold(strings.TrimSpace(row.BillingMode), "per_call")
-		hasPrice := row.InputPricePerMillion != 0 || row.OutputPricePerMillion != 0 ||
-			row.CacheReadPricePerMillion != 0 || row.PerCallUSD != 0
+		isPerCall := strings.EqualFold(strings.TrimSpace(model.BillingMode), "per_call")
+		hasPrice := model.InputPricePerMillion != 0 || model.OutputPricePerMillion != 0 ||
+			model.CacheReadPricePerMillion != 0 || model.PerCallUSD != 0
 		if !hasPrice && !isPerCall {
-			// No price signal: clear the override so the key falls back to
-			// global alias pricing.
 			ref.InputPricePerMillion = nil
 			ref.OutputPricePerMillion = nil
 			ref.CacheReadPricePerMillion = nil
 			ref.PerCallUSD = nil
 			continue
 		}
-		in := row.InputPricePerMillion
-		out := row.OutputPricePerMillion
-		cacheRead := row.CacheReadPricePerMillion
-		perCall := row.PerCallUSD
-		ref.InputPricePerMillion = &in
-		ref.OutputPricePerMillion = &out
+		input := model.InputPricePerMillion
+		output := model.OutputPricePerMillion
+		cacheRead := model.CacheReadPricePerMillion
+		perCall := model.PerCallUSD
+		ref.InputPricePerMillion = &input
+		ref.OutputPricePerMillion = &output
 		ref.CacheReadPricePerMillion = &cacheRead
 		ref.PerCallUSD = &perCall
 	}
@@ -1462,8 +1486,7 @@ func (s *Store) usageSnapshotLocked() map[string]*UsageState {
 
 // FlushUsage persists the current usage ledger to the state file alongside the
 // current key list. Called by the background flusher and at lifecycle points
-// (reconfigure / shutdown). It is serialized with manual usage resets so a
-// stale flush cannot restore cleared counters.
+// (reconfigure / shutdown).
 func (s *Store) FlushUsage() error {
 	s.usagePersistMu.Lock()
 	defer s.usagePersistMu.Unlock()
@@ -1485,7 +1508,10 @@ func (s *Store) FlushUsage() error {
 func (s *Store) saveState(path string, keys []KeyConfig, usage map[string]*UsageState, aliases []AliasMapping, rules []ClassifyRule) error {
 	s.persistMu.Lock()
 	defer s.persistMu.Unlock()
-	return SaveState(path, keys, usage, aliases, rules)
+	s.mu.RLock()
+	globalWeightedRoundRobin := s.globalWeightedRoundRobin
+	s.mu.RUnlock()
+	return saveStateWithSettings(path, keys, usage, aliases, rules, globalWeightedRoundRobin)
 }
 
 func (s *Store) saveUsageOnly(path string, usage map[string]*UsageState) error {
@@ -1552,6 +1578,7 @@ func (f *usageFlusher) loop() {
 func (s *Store) Status() map[string]any {
 	s.mu.RLock()
 	enabled := s.enabled
+	globalWeightedRoundRobin := s.globalWeightedRoundRobin
 	statePath := s.statePath
 	keys := s.keysSnapshotLocked()
 	limiter := s.limiter
@@ -1562,11 +1589,12 @@ func (s *Store) Status() map[string]any {
 		rpmUsage = limiter.Snapshot()
 	}
 	out := map[string]any{
-		"enabled":    enabled,
-		"state_file": statePath,
-		"key_count":  len(keys),
-		"rpm_usage":  rpmUsage,
-		"usage":      usageSummaryForKeys(usage, keys),
+		"enabled":                     enabled,
+		"global_weighted_round_robin": globalWeightedRoundRobin,
+		"state_file":                  statePath,
+		"key_count":                   len(keys),
+		"rpm_usage":                   rpmUsage,
+		"usage":                       usageSummaryForKeys(usage, keys),
 	}
 	return out
 }

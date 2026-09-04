@@ -2,7 +2,19 @@ import { useEffect, useState, useCallback } from "react";
 import { useNavigate, useParams, useLocation } from "react-router-dom";
 import { useT } from "../i18n";
 import type { AliasMapping, AliasTarget, ClassifyRule, ClassifyPreviewResponse, CredentialDescriptor } from "../types";
-import { fetchAliases, upsertAlias, deleteAlias, fetchClassifyRules, upsertClassifyRule, deleteClassifyRule, reorderClassifyRules, classifyPreview, fetchCredentialDescriptors } from "../api/mappings";
+import {
+  fetchAliases,
+  upsertAlias,
+  deleteAlias,
+  fetchClassifyRules,
+  upsertClassifyRule,
+  deleteClassifyRule,
+  reorderClassifyRules,
+  classifyPreview,
+  fetchCredentialDescriptors,
+  fetchSchedulerSettings,
+  updateSchedulerSettings,
+} from "../api/mappings";
 
 export default function Mapping() {
   const t = useT();
@@ -40,12 +52,18 @@ function AliasListTab() {
   const [aliases, setAliases] = useState<AliasMapping[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [globalWeighted, setGlobalWeighted] = useState(false);
+  const [settingsSaving, setSettingsSaving] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const list = await fetchAliases();
+      const [list, settings] = await Promise.all([
+        fetchAliases(),
+        fetchSchedulerSettings(),
+      ]);
       setAliases(list);
+      setGlobalWeighted(settings.global_weighted_round_robin);
     } catch (e: unknown) {
       setError(String(e));
     } finally {
@@ -64,9 +82,39 @@ function AliasListTab() {
     }
   };
 
+  const handleGlobalWeightedChange = async (enabled: boolean) => {
+    const previous = globalWeighted;
+    setGlobalWeighted(enabled);
+    setSettingsSaving(true);
+    setError("");
+    try {
+      const settings = await updateSchedulerSettings(enabled);
+      setGlobalWeighted(settings.global_weighted_round_robin);
+    } catch (e: unknown) {
+      setGlobalWeighted(previous);
+      setError(t("mapping.globalWeightedSaveFailed") + ": " + String(e));
+    } finally {
+      setSettingsSaving(false);
+    }
+  };
+
   return (
     <>
       <div className="map-toolbar">
+        <label className="switch map-global-toggle" title={t("mapping.globalWeightedTitle")}>
+          <span className="map-global-label">{t("mapping.globalWeighted")}</span>
+          <input
+            type="checkbox"
+            checked={globalWeighted}
+            disabled={loading || settingsSaving}
+            onChange={(event) => void handleGlobalWeightedChange(event.target.checked)}
+            aria-label={t("mapping.globalWeighted")}
+            aria-busy={settingsSaving}
+          />
+          <span className="track" aria-hidden="true">
+            <span className="thumb" />
+          </span>
+        </label>
         <button className="btn primary" onClick={() => nav("/mapping/alias/new")}>
           + {t("mapping.newAlias")}
         </button>

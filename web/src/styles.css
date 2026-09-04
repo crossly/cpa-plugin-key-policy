@@ -891,7 +891,14 @@ td.strong { font-weight: 600; color: var(--text); }
 }
 .map-tab:hover { color: var(--text); }
 .map-tab.active { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
-.map-toolbar { display: flex; justify-content: flex-end; margin-bottom: 16px; }
+.map-toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 12px; margin-bottom: 16px; }
+.map-global-toggle {
+  min-height: 42px; padding: 6px 10px; gap: 9px; border: 1px solid var(--border);
+  border-radius: 8px; background: var(--card); color: var(--text);
+}
+.map-global-toggle:hover { border-color: var(--border-hover); }
+.map-global-label { font-size: 13px; font-weight: 600; white-space: nowrap; }
+.map-global-toggle:has(input:disabled) { opacity: .65; cursor: wait; }
 
 /* Alias cards grid */
 .alias-grid {
@@ -1062,6 +1069,8 @@ td.strong { font-weight: 600; color: var(--text); }
   .alias-grid { grid-template-columns: 1fr; }
   .rule-list { max-width: 100%; }
   .map-form-page { padding: 16px; }
+  .map-toolbar { justify-content: space-between; }
+  .map-global-toggle { min-width: 0; }
 }
 
 /* KeyForm existing-aliases quick-pick section */

@@ -60,6 +60,15 @@ Two sources of “which auth file may serve this request”:
 
 **Runtime rule:** if a mapping sets a group, the plugin scheduler **only** picks auth files in that group. No match → hard failure (`auth_not_found`), never silently fall back to another tier.
 
+**Scheduling:** the plugin keeps the highest available `Priority` tier, then applies **smooth weighted round-robin** using each credential's `weight`:
+
+- Weight is read from the CPA credential candidate's `Weight`, `Attributes.weight`, or `Metadata.weight` field.
+- Missing or invalid weight defaults to `1`; non-positive weight stops new requests; values are capped at `1000000`.
+- State is shared globally by `provider + model + group + Priority`, so all downstream `cpa_…` keys contribute to one distribution. An empty group is one global pool containing every candidate CPA offers for that provider/model.
+- Lower-priority credentials participate only when every higher-priority credential is unavailable or has non-positive weight.
+- When CPA does not propagate frontend-auth group metadata (including CPA `7.2.140`), plugin-owned keys still use global weighted round-robin instead of falling back to CPA's `routing.strategy`; native CPA keys remain untouched.
+- With `global_weighted_round_robin: true`, the plugin deliberately ignores group even when CPA propagates it, then schedules by Weight across every current provider/model candidate.
+
 **Custom classification** (Web UI → Mapping → Credential Classification):
 
 - Match auth-file fields (`filename`, `provider`, `plan_type`, `tier`, …) with a regex.
@@ -83,8 +92,8 @@ Channels under CPA `openai-compatibility` (e.g. a named proxy) use the **channel
 |------|------|
 | Frontend auth | Know plugin keys; enforce alias allow-list, RPM, budget; stamp route + group metadata |
 | Model router | Alias → provider + target model |
-| Scheduler | When `group` is set, filter auth candidates by tier / `classify:` group |
-| Request interceptor | OpenAI-compatible daily/weekly quota rejection before upstream auth |
+| Scheduler | Optionally filter candidates by `group`, then smooth-weight them within the highest Priority tier |
+| Request interceptor | Schema 2: HTTP 429 policy responses before upstream auth; older hosts retain fail-closed auth behavior |
 | Response interceptor | Non-stream JSON: rewrite top-level `model` back to the alias |
 | Usage | Token / per-call billing into the state file |
 | Management API + embedded Web UI | Keys, aliases, classify rules, status |
@@ -123,11 +132,14 @@ plugins:
       enabled: true
       priority: 10
       state_file: "cpa-key-policy-state.json"
+      global_weighted_round_robin: true
 ```
 
 Notes:
 
 - If `state_file` exists, it is the source of truth for keys / aliases / classify rules / usage.
+- `global_weighted_round_robin: true` ignores the selected alias target group and places every current provider/model candidate in one global pool. Distribution then follows the Weight values on CPA's credential page. The default is `false`.
+- With this option enabled, alias-level group rotation no longer restricts the final credential. Native CPA keys remain unaffected.
 - Prefer creating keys and aliases in the **Web UI** or Management API; seed YAML `keys` is mainly for first boot.
 - Never commit real key hashes, management secrets, or live host URLs into public docs.
 
@@ -171,13 +183,9 @@ Exact paths (no path templates). Auth: CPA management bearer token.
 - `GET/POST/PATCH/DELETE …/keys` (`id` in query or body for mutate)
 - `POST …/keys/rotate?id=…`
 - `POST …/keys/reset-rpm?id=…`
-- `POST …/keys/reset-usage?id=…` — clear the key's daily/weekly usage and per-alias counters; persists immediately
+- `POST …/keys/reset-usage?id=…` — clear daily/weekly usage and per-alias counters; persists immediately
 - `GET …/keys/usage?id=…`
 - `GET …/status`
-
-`reset-usage` clears only the current daily/weekly ledger and per-alias
-counters. It does not change the key, its limits, or the RPM counter;
-`reset-rpm` remains a separate operation.
 
 **Aliases**
 
@@ -231,42 +239,28 @@ curl -X POST "$CPA/v0/management/plugins/cpa-key-policy/aliases" \
 |------|--------|
 | Known key + allowed alias | Auth OK → route → optional group filter → upstream |
 | Known key + unknown model | Auth rejected |
-| RPM exceeded | Rejected with HTTP 429 in the request's native protocol format (`rate_limit_error` / `rate_limit_exceeded` for OpenAI-compatible requests) |
-| Daily / weekly budget exceeded | Rejected with HTTP 429; OpenAI-compatible paths use dynamic `insufficient_quota` JSON, while Claude/Gemini paths keep their native error envelope |
+| RPM exceeded | HTTP 429 in the request's native protocol format (`rate_limit_error` / `rate_limit_exceeded` for OpenAI-compatible requests) |
+| Daily / weekly budget exceeded | HTTP 429 with dynamic usage, limit, reset time, and `Retry-After`; OpenAI-compatible paths use `insufficient_quota` JSON |
 | Group set, no matching auth file | `auth_not_found` / unavailable (no cross-tier leak) |
 | Unknown key | Plugin declines; CPA may try native `api-keys` |
 | Non-stream chat response | Top-level `model` rewritten to alias |
 | Stream | Body not rewritten (v1) |
 
-For OpenAI-compatible paths, a daily or weekly budget rejection is emitted by
-the request interceptor before upstream auth selection:
+For OpenAI-compatible paths, quota rejection is emitted by the request
+interceptor before upstream auth selection. The exact values come from the
+current key ledger and the negotiated plugin protocol schema 2 or later.
 
-```http
-HTTP/1.1 429 Too Many Requests
-Content-Type: application/json
-Retry-After: 50400
-```
-
-```json
-{
-  "error": {
-    "message": "Daily quota exceeded. Usage: $10.00 / $10.00 USD. Resets at 2026-09-03T00:00:00Z.",
-    "type": "insufficient_quota",
-    "param": null,
-    "code": "daily_quota_exceeded"
-  }
-}
-```
-
-The usage, limit, reset timestamp, window, and `Retry-After` value are
-calculated from the current key ledger. This requires a CPA host that
-negotiates plugin protocol schema 2 or later; older hosts keep the previous
-fail-closed authentication behavior.
-
+`reset-usage` clears only the current daily/weekly ledger and per-alias
+counters. It does not change the key, its configured limits, or the RPM
+counter; `reset-rpm` is a separate operation.
 
 ### `/v1/models` on CPA main port
 
-Per-key `allow_models_endpoint`: **binary** — deny (401) or full global list. CPA cannot filter that list per plugin key on the main port. A denied, known key is still a valid key; the generic 401 is a CPA frontend-auth limitation because this endpoint bypasses the execution/request-interceptor chain. A precise 403 requires host-level support for explicit auth denials.
+Per-key `allow_models_endpoint`: **binary** — deny (401) or full global list.
+CPA cannot filter that list per plugin key on the main port. A denied, known
+key is still valid; the generic 401 is a host frontend-auth limitation because
+this endpoint bypasses the request-interceptor chain. A precise 403 requires
+host-level explicit auth-denial support.
 
 
 ---
