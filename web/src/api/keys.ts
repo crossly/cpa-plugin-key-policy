@@ -48,9 +48,14 @@ export async function resetRPM(id: string): Promise<void> {
   await c.post(pluginPath("/keys/reset-rpm"), { id });
 }
 
+export async function resetUsage(id: string): Promise<void> {
+  const c = apiClient();
+  await c.post(pluginPath("/keys/reset-usage"), { id });
+}
+
 // fetchKeyUsage returns the per-alias usage breakdown for one key (the key
 // detail subpage data source). id goes through the query string, matching the
-// rotate/reset-rpm/delete convention.
+// rotate/reset-rpm/reset-usage/delete convention.
 export async function fetchKeyUsage(id: string): Promise<KeyUsageResponse> {
   const c = apiClient();
   const { data } = await c.get<KeyUsageResponse>(pluginPath("/keys/usage"), {

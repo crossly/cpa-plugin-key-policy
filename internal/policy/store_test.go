@@ -86,6 +86,24 @@ func TestStoreAuthenticateRateLimits(t *testing.T) {
 	}
 }
 
+func TestResetUsagePreservesRPMWindow(t *testing.T) {
+	store, plain := newTestStore(t)
+	headers := http.Header{"Authorization": {"Bearer " + plain}}
+	if decision := store.Authenticate("POST", "/v1/chat/completions", headers, nil, []byte(`{"model":"fast"}`)); !decision.Allowed {
+		t.Fatalf("first request = %+v, want allowed", decision)
+	}
+	store.usage.RecordCost("team-a", "fast", 3, 0, 0, 0, 0, 1)
+	if err := store.ResetUsage("team-a"); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.UsageSummaryFor(store.Keys()[0]); got.DailyUSD != 0 || got.WeeklyUSD != 0 || got.DailyCallCount != 0 || got.WeeklyCallCount != 0 {
+		t.Fatalf("usage after reset = %+v, want zero", got)
+	}
+	if decision := store.Authenticate("POST", "/v1/chat/completions", headers, nil, []byte(`{"model":"fast"}`)); !decision.RateLimited || decision.Allowed {
+		t.Fatalf("request after usage reset = %+v, want original RPM window preserved", decision)
+	}
+}
+
 // perCallImageStore builds a store with one per_call-billed image alias, used
 // to exercise the access-time pre-charge for image/video endpoints.
 func perCallImageStore(t *testing.T) (*Store, string) {

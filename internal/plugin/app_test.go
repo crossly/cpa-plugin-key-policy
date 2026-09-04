@@ -687,6 +687,82 @@ func TestManagementKeyUsageEndpoint(t *testing.T) {
 	}
 }
 
+func TestManagementResetUsageEndpoint(t *testing.T) {
+	app, _ := configurePricedApp(t)
+	key := app.Store().Keys()[0]
+
+	usageReq, _ := json.Marshal(UsageHandleRequest{
+		APIKey: "priced",
+		Alias:  "fast",
+		Model:  "gpt-5-codex",
+		Detail: UsageDetail{InputTokens: 200_000, OutputTokens: 100_000, TotalTokens: 300_000},
+	})
+	if _, err := app.HandleMethod(MethodUsageHandle, usageReq); err != nil {
+		t.Fatal(err)
+	}
+	before := app.Store().UsageSummaryFor(key)
+	if !nearly(before.DailyUSD, 0.30) || before.DailyCallCount != 1 || !nearly(before.WeeklyUSD, 0.30) {
+		t.Fatalf("before reset usage = %+v, want 0.30/0.30 and one call", before)
+	}
+
+	resetReq, _ := json.Marshal(ManagementRequest{
+		Method: http.MethodPost,
+		Path:   "/v0/management/plugins/cpa-key-policy/keys/reset-usage",
+		Body:   []byte(`{"id":"priced"}`),
+	})
+	resp := managementResponseFromEnvelope(t, mustHandle(t, app, MethodManagementHandle, resetReq))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("reset status = %d, body = %s", resp.StatusCode, resp.Body)
+	}
+	var resetBody struct {
+		Reset bool   `json:"reset"`
+		ID    string `json:"id"`
+	}
+	if err := json.Unmarshal(resp.Body, &resetBody); err != nil {
+		t.Fatalf("reset response: %v; body=%s", err, resp.Body)
+	}
+	if !resetBody.Reset || resetBody.ID != "priced" {
+		t.Fatalf("reset response = %+v, want reset=true/id=priced", resetBody)
+	}
+
+	after := app.Store().UsageSummaryFor(key)
+	if !nearly(after.DailyUSD, 0) || !nearly(after.WeeklyUSD, 0) || after.DailyCallCount != 0 || after.WeeklyCallCount != 0 {
+		t.Fatalf("after reset usage = %+v, want zero daily/weekly counters", after)
+	}
+	_, aliases, ok := app.Store().AliasUsageFor("priced")
+	if !ok || len(aliases) != 1 || !nearly(aliases[0].Daily.TotalUSD, 0) || !nearly(aliases[0].Weekly.TotalUSD, 0) || aliases[0].Daily.CallCount != 0 || aliases[0].Weekly.CallCount != 0 {
+		t.Fatalf("after reset aliases = %+v, want one zeroed alias", aliases)
+	}
+
+	state, err := policy.LoadState(app.Store().StatePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := state.Usage["priced"]; exists {
+		t.Fatalf("persisted usage still contains reset key: %+v", state.Usage["priced"])
+	}
+
+	unknownReq, _ := json.Marshal(ManagementRequest{
+		Method: http.MethodPost,
+		Path:   "/v0/management/plugins/cpa-key-policy/keys/reset-usage",
+		Body:   []byte(`{"id":"missing"}`),
+	})
+	unknown := managementResponseFromEnvelope(t, mustHandle(t, app, MethodManagementHandle, unknownReq))
+	if unknown.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown reset status = %d, want 404", unknown.StatusCode)
+	}
+
+	unknownRPM, _ := json.Marshal(ManagementRequest{
+		Method: http.MethodPost,
+		Path:   "/v0/management/plugins/cpa-key-policy/keys/reset-rpm",
+		Body:   []byte(`{"id":"missing"}`),
+	})
+	rpmResp := managementResponseFromEnvelope(t, mustHandle(t, app, MethodManagementHandle, unknownRPM))
+	if rpmResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown RPM reset status = %d, want 404", rpmResp.StatusCode)
+	}
+}
+
 func mustHandle(t *testing.T, app *App, method string, req []byte) []byte {
 	t.Helper()
 	raw, err := app.HandleMethod(method, req)

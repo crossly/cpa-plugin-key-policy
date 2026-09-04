@@ -597,7 +597,7 @@ td.strong { font-weight: 600; color: var(--text); }
 
 /* Desktop hover action row (>= 641px). Not an overlay — it sits at the
  * card footer and expands on hover/focus-within, so card info stays visible
- * and the 5 buttons never get clipped (Stitch's inset-0 overlay clipped them
+ * and the 6 buttons never get clipped (Stitch's inset-0 overlay clipped them
  * on short cards). */
 .keycard .kc-actions {
   display: none; /* hidden on mobile; grid shown on desktop */
@@ -615,7 +615,7 @@ td.strong { font-weight: 600; color: var(--text); }
   }
   .keycard:hover .kc-actions,
   .keycard:focus-within .kc-actions {
-    max-height: 80px; opacity: 1;
+    max-height: 110px; opacity: 1;
     margin-top: 12px; padding-top: 12px; border-top-width: 1px;
   }
   .keycard.disabled .kc-actions { max-height: 0 !important; opacity: 0 !important; overflow: hidden; }

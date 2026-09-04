@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { fetchKeyUsage } from "../api/keys";
+import { fetchKeyUsage, resetUsage } from "../api/keys";
 import type { AliasUsageEntry, KeyUsageResponse, UsageWindow } from "../types";
 import { useT } from "../i18n";
 import { MobileTabBar } from "./KeyList";
@@ -49,6 +49,7 @@ export default function KeyUsage() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [win, setWin] = useState<Window>("daily");
+  const [resetting, setResetting] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -74,6 +75,22 @@ export default function KeyUsage() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
+
+  const onResetUsage = async () => {
+    const keyId = data?.key_id ?? decodeURIComponent(id ?? "");
+    if (!keyId || !confirm(t("keys.resetUsageConfirm", { id: keyId }))) return;
+    setResetting(true);
+    setError("");
+    try {
+      await resetUsage(keyId);
+      setData(await fetchKeyUsage(keyId));
+    } catch (e) {
+      const err = e as { response?: { data?: { error?: { message?: string } } }; message?: string };
+      setError(err.response?.data?.error?.message ?? err.message ?? t("keys.resetUsageFailed"));
+    } finally {
+      setResetting(false);
+    }
+  };
 
   if (loading) return <div className="muted">{t("keyUsage.loading")}</div>;
   if (error || !data) return <div className="error">{error || t("keyUsage.notFound")}</div>;
@@ -108,6 +125,14 @@ export default function KeyUsage() {
           >
             <button type="button" className="btn sm">{t("keys.edit")}</button>
           </Link>
+          <button
+            type="button"
+            className="btn sm danger-outline"
+            disabled={resetting}
+            onClick={() => { void onResetUsage(); }}
+          >
+            {t("keys.resetUsage")}
+          </button>
         </div>
         <div className="seg" role="tablist" aria-label={t("keyUsage.windowToggle")}>
           <button

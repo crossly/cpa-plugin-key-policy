@@ -147,7 +147,7 @@ UI areas:
 
 | Tab / page | Use for |
 |------------|---------|
-| Keys | Create / edit / rotate / delete keys; bind models or aliases; RPM & budgets |
+| Keys | Create / edit / rotate / delete keys; bind models or aliases; RPM & budgets; manually reset daily/weekly usage |
 | Mapping → Aliases | Global multi-target aliases, dispatch, pricing |
 | Mapping → Classification | Custom credential groups + match preview |
 | Model picker | Catalog of providers; tier / **Custom · …** subgroups |
@@ -171,8 +171,13 @@ Exact paths (no path templates). Auth: CPA management bearer token.
 - `GET/POST/PATCH/DELETE …/keys` (`id` in query or body for mutate)
 - `POST …/keys/rotate?id=…`
 - `POST …/keys/reset-rpm?id=…`
+- `POST …/keys/reset-usage?id=…` — clear the key's daily/weekly usage and per-alias counters; persists immediately
 - `GET …/keys/usage?id=…`
 - `GET …/status`
+
+`reset-usage` clears only the current daily/weekly ledger and per-alias
+counters. It does not change the key, its limits, or the RPM counter;
+`reset-rpm` remains a separate operation.
 
 **Aliases**
 

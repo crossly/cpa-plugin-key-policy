@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { listKeys, deleteKey, rotateKey, resetRPM } from "../api/keys";
+import { listKeys, deleteKey, rotateKey, resetRPM, resetUsage } from "../api/keys";
 import type { KeyPublic } from "../types";
 import PlainKeyModal from "../components/PlainKeyModal";
 import { useT } from "../i18n";
@@ -20,6 +20,7 @@ export default function KeyList() {
   const [loading, setLoading] = useState(true);
   const [plain, setPlain] = useState<string | null>(null);
   const [plainTitle, setPlainTitle] = useState<string>("");
+  const [resettingUsageId, setResettingUsageId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -59,6 +60,19 @@ export default function KeyList() {
     }
   };
 
+  const onResetUsage = async (id: string) => {
+    if (!confirm(t("keys.resetUsageConfirm", { id }))) return;
+    setResettingUsageId(id);
+    try {
+      await resetUsage(id);
+      await load();
+    } catch (e) {
+      alert((e as Error).message ?? t("keys.resetUsageFailed"));
+    } finally {
+      setResettingUsageId(null);
+    }
+  };
+
   const onDelete = async (id: string) => {
     if (!confirm(t("keys.deleteConfirm", { id }))) return;
     try {
@@ -91,8 +105,10 @@ export default function KeyList() {
               key={k.id}
               k={k}
               onDelete={onDelete}
-              onRotate={onRotate}
               onReset={onReset}
+              onRotate={onRotate}
+              onResetUsage={onResetUsage}
+              resettingUsageId={resettingUsageId}
             />
           ))}
         </div>
@@ -122,11 +138,15 @@ function KeyCard({
   onDelete,
   onRotate,
   onReset,
+  onResetUsage,
+  resettingUsageId,
 }: {
   k: KeyPublic;
   onDelete: (id: string) => void;
   onRotate?: (id: string) => void;
   onReset?: (id: string) => void;
+  onResetUsage: (id: string) => void;
+  resettingUsageId: string | null;
 }) {
   const t = useT();
   const nav = useNavigate();
@@ -248,8 +268,15 @@ function KeyCard({
         <Link to={`/keys/${encodeURIComponent(k.id)}/edit`}>
           <button className="btn sm" onClick={(e) => e.stopPropagation()}>{t("keys.edit")}</button>
         </Link>
-        {onReset && <button className="btn sm" onClick={(e) => { e.stopPropagation(); onReset(k.id); }}>{t("keys.resetRpm")}</button>}
         {onRotate && <button className="btn sm" onClick={(e) => { e.stopPropagation(); onRotate(k.id); }}>{t("keys.rotate")}</button>}
+        {onReset && <button className="btn sm" onClick={(e) => { e.stopPropagation(); onReset(k.id); }}>{t("keys.resetRpm")}</button>}
+        <button
+          className="btn sm danger-outline"
+          disabled={resettingUsageId === k.id}
+          onClick={(e) => { e.stopPropagation(); onResetUsage(k.id); }}
+        >
+          {t("keys.resetUsage")}
+        </button>
         <button className="btn sm danger" onClick={(e) => { e.stopPropagation(); onDelete(k.id); }}>{t("keys.delete")}</button>
       </div>
     </div>

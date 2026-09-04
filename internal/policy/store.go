@@ -13,15 +13,16 @@ import (
 )
 
 type Store struct {
-	mu         sync.RWMutex
-	updateMu   sync.Mutex
-	persistMu  sync.Mutex
-	enabled    bool
-	statePath  string
-	keys       map[string]*KeyConfig
-	keysByHash map[string]*KeyConfig
-	limiter    *RateLimiter
-	usage      *usageLedger
+	mu             sync.RWMutex
+	updateMu       sync.Mutex
+	persistMu      sync.Mutex
+	usagePersistMu sync.Mutex
+	enabled        bool
+	statePath      string
+	keys           map[string]*KeyConfig
+	keysByHash     map[string]*KeyConfig
+	limiter        *RateLimiter
+	usage          *usageLedger
 	// flusher for periodically persisting the usage ledger to the state file.
 	flusher *usageFlusher
 	// aliases is the global alias mapping table from config.yaml. Used to
@@ -728,12 +729,35 @@ func (s *Store) RateLimitForAPIKey(raw string) (blocked bool, retryAfterSeconds,
 	return blocked, retryAfterSeconds, key.RPM, true
 }
 
-// ResetUsage clears in-memory usage for a key (manual quota unlock).
-func (s *Store) ResetUsage(id string) {
-	_, usage := s.runtimeComponents()
-	if usage != nil {
-		usage.resetUsage(id)
+// ResetUsage clears daily/weekly usage and all per-alias counters for a key.
+// The reset is persisted immediately so the background usage flusher cannot
+// resurrect the old ledger after a manual reset.
+func (s *Store) ResetUsage(id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return errors.New("id is required")
 	}
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+	s.usagePersistMu.Lock()
+	defer s.usagePersistMu.Unlock()
+
+	s.mu.Lock()
+	if _, ok := s.keys[id]; !ok {
+		s.mu.Unlock()
+		return ErrUnknownKey
+	}
+	if s.usage != nil {
+		s.usage.resetUsage(id)
+	}
+	keys := s.keysSnapshotLocked()
+	usage := s.usageSnapshotLocked()
+	path := s.statePath
+	aliases := s.aliasesSnapshotLocked()
+	rules := s.classifyRulesSnapshotLocked()
+	s.mu.Unlock()
+
+	return s.saveState(path, keys, usage, aliases, rules)
 }
 
 // AliasUsageFor returns a per-alias usage breakdown for the key with the given
@@ -1182,8 +1206,17 @@ func (s *Store) RotateKey(id string) (string, KeyConfig, error) {
 }
 
 func (s *Store) ResetRPM(id string) error {
-	if strings.TrimSpace(id) == "" {
+	id = strings.TrimSpace(id)
+	if id == "" {
 		return errors.New("id is required")
+	}
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+	s.mu.RLock()
+	_, ok := s.keys[id]
+	s.mu.RUnlock()
+	if !ok {
+		return ErrUnknownKey
 	}
 	limiter, _ := s.runtimeComponents()
 	if limiter != nil {
@@ -1429,8 +1462,11 @@ func (s *Store) usageSnapshotLocked() map[string]*UsageState {
 
 // FlushUsage persists the current usage ledger to the state file alongside the
 // current key list. Called by the background flusher and at lifecycle points
-// (reconfigure / shutdown).
+// (reconfigure / shutdown). It is serialized with manual usage resets so a
+// stale flush cannot restore cleared counters.
 func (s *Store) FlushUsage() error {
+	s.usagePersistMu.Lock()
+	defer s.usagePersistMu.Unlock()
 	s.mu.Lock()
 	usage := s.usageSnapshotLocked()
 	path := s.statePath

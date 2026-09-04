@@ -143,7 +143,7 @@ http://<你的-cpa-主机>:<api端口>/v0/resource/plugins/cpa-key-policy/index.
 
 | 区域 | 用途 |
 |------|------|
-| Keys | 创建/编辑/轮换/删除 key；绑模型或别名；RPM 与额度 |
+| Keys | 创建/编辑/轮换/删除 key；绑定模型或别名；RPM 与额度；手动重置每日/每周用量 |
 | 映射 → 别名 | 全局多目标别名、调度方式、定价 |
 | 映射 → 凭证归类 | 自定义分组规则与命中预览 |
 | 选模型 | 提供商目录；内置档 / **自定义 · …** 子组 |
@@ -162,7 +162,16 @@ VITE_CPA_BASE=http://127.0.0.1:8317 npm run dev
 
 路径为精确匹配。鉴权：CPA 管理 Bearer。
 
-**Key：** `GET/POST/PATCH/DELETE …/keys`，以及 `rotate` / `reset-rpm` / `usage` / `status`  
+**Key：**
+
+- `GET/POST/PATCH/DELETE …/keys`（变更操作的 `id` 在 query 或 body）
+- `POST …/keys/rotate?id=…`
+- `POST …/keys/reset-rpm?id=…`
+- `POST …/keys/reset-usage?id=…` — 清除该 key 的每日/每周用量与每别名统计，并立即持久化
+- `GET …/keys/usage?id=…`
+- `GET …/status`
+
+`reset-usage` 只清除当前每日/每周 ledger 和每别名统计，不会修改 key、额度上限或 RPM 计数；`reset-rpm` 仍是独立操作。
 
 **别名：** `GET/POST/DELETE …/aliases`  
 
